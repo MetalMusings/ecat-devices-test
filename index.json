@@ -7,7 +7,20 @@
    "name": "TEST device (prototype check, not a real device)",
    "path": "devices/00000099-00000001/1.yaml",
    "product": "0x00000001",
-   "reports": [],
+   "reports": [
+    {
+     "author": "MetalMusings",
+     "file": "devices/00000099-00000001/1.yaml",
+     "firmware": null,
+     "result": "worked",
+     "revision": "0x00000002",
+     "updated": "2026-11-26T17:30:56Z",
+     "used": [
+      "settings 0x2009:00"
+     ],
+     "words": "Test report from the prototype check."
+    }
+   ],
    "upvotes": 1,
    "url": "https://github.com/MetalMusings/ecat-devices-test/discussions/1",
    "vendor": "0x00000099"
