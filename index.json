@@ -1,4 +1,17 @@
 {
- "files": [],
+ "files": [
+  {
+   "author": "MetalMusings",
+   "discussion": 1,
+   "facts": 2,
+   "name": "TEST device (prototype check, not a real device)",
+   "path": "devices/00000099-00000001/1.yaml",
+   "product": "0x00000001",
+   "reports": [],
+   "upvotes": 1,
+   "url": "https://github.com/MetalMusings/ecat-devices-test/discussions/1",
+   "vendor": "0x00000099"
+  }
+ ],
  "format": 1
 }

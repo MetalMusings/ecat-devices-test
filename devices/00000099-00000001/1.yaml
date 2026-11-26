@@ -1,0 +1,20 @@
+# From Discussion #1 by MetalMusings (https://github.com/MetalMusings/ecat-devices-test/discussions/1). CC0 1.0 (https://creativecommons.org/publicdomain/zero/1.0/)
+format: 1
+name: TEST device (prototype check, not a real device)
+match:
+  vendor: '0x00000099'
+  product: '0x00000001'
+commands:
+  '0x2010': Zero Position (test)
+settings:
+- object: 0x2009:00
+  type: UINT
+  value: 2000
+  name: Filter time (test)
+sources:
+  commands 0x2010:
+    kind: manual
+    ref: test, not a real manual
+  settings 0x2009:00:
+    kind: tried
+    date: '2026-11-26'
