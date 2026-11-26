@@ -1,0 +1,629 @@
+"""Test mode: run the ecat component in halrun with a servo thread, without
+LinuxCNC, so that inputs can be read and outputs set from EtherCAT Setup.
+
+The configuration being edited is written to a folder of its own and
+loaded from there, so unsaved changes can be tried. Pins are read and set
+with halcmd. (A component of LinuxCNC's Python hal module in the setup
+program would be killed by halrun's "unload all" when the test stops.)
+
+The pins of CiA 402 drives and the master's pins are read-only in the
+I/O test's pin tables. A drive is enabled only through drivetest.py, and
+its safety does not depend on this program: every cia402 drive's
+watchdog-ms is set in the HAL file, and the drive is shut down in the
+servo thread if its watchdog pin, which this program counts up
+(tick_watchdogs()), stops changing.
+
+A CSP drive's pos-cmd comes from a limit3, so that it moves only at the
+test's velocity and acceleration and within its travel. While the drive
+is not in "Operation enabled", the limit3 is loaded with pos-fb, so that
+enabling it never makes a jump; once enabled, it follows the target that
+drivetest.py sets (the mux2's in1).
+
+Before the test stops, every drive is disabled, pins set during the test
+go back to 0, and the slaves are taken to PREOP (ecat.take-down).
+
+The free-running master (ethercat-uspace start) hands the bus over to the
+component by itself; it does not come back when the test stops.
+
+Only one test runs at a time, also with several windows open: a test
+holds TEST_LOCK (flock, let go by the system when the process ends), and
+another window that tries to start one is told which process holds it.
+Limits a drive test wrote into a drive belong to the test that holds the
+lock, so another window must not write them back meanwhile.
+"""
+
+import fcntl
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+
+from . import config, kernelmaster, lcnc_env, netif, quirks
+
+HALRUN = os.environ.get("ECAT_HALRUN") or lcnc_env.program("halrun")
+HALCMD = os.environ.get("ECAT_HALCMD") or lcnc_env.program("halcmd")
+KERNEL_MASTER = kernelmaster.DEVICE
+KERNEL_CONFS = kernelmaster.CONFS
+TEST_LOCK = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                         "ecatsetup", "test.lock")
+
+
+RUN_PREFIX = "ecatsetup-test-"
+# a run's folder as tempfile.mkdtemp names it: the prefix and 8 characters
+# (the test suite's ecatsetup-test-state-... and the like are longer)
+_RUN_DIR = re.compile(r"^%s[a-z0-9_]{8}$" % re.escape(RUN_PREFIX))
+RUN_FILES = {"ethercat.yaml", "test.hal", "halrun.log"}
+
+
+def remove_old_runs(root=None):
+    """Remove the folders of earlier tests (their configuration, HAL file and
+    halrun log) from the temporary folder: only this user's, and only those
+    that hold nothing but a test's files. Called when a test starts, with the
+    test lock held, so the last run's log stays until the next test.
+    Returns how many were removed."""
+    root = root or tempfile.gettempdir()
+    removed = 0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    for name in names:
+        path = os.path.join(root, name)
+        if not _RUN_DIR.match(name) or os.path.islink(path) or not os.path.isdir(path):
+            continue
+        try:
+            if os.stat(path).st_uid != os.getuid() or not set(os.listdir(path)) <= RUN_FILES:
+                continue
+            shutil.rmtree(path)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _lock_file():
+    os.makedirs(os.path.dirname(TEST_LOCK), exist_ok=True)
+    return open(TEST_LOCK, "a+")
+
+
+def lock_test():
+    """Take the test lock; the open file holds it until unlock_test(). Raises
+    TestError naming the process that holds it."""
+    f = _lock_file()
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.seek(0)
+        pid = f.read().strip()
+        f.close()
+        raise TestError("Another EtherCAT Setup%s is running a test or moving a drive: stop it "
+                        "there first" % (" (process %s)" % pid if pid else ""))
+    f.seek(0)
+    f.truncate()
+    f.write("%d\n" % os.getpid())
+    f.flush()
+    return f
+
+
+def unlock_test(f):
+    if f is not None:
+        try:
+            f.seek(0)
+            f.truncate()
+            fcntl.flock(f, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        f.close()
+
+
+def test_holder():
+    """The process id of another process that runs a test now, else None."""
+    try:
+        f = _lock_file()
+    except OSError:
+        return None
+    with f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_UN)
+            return None
+        except OSError:
+            f.seek(0)
+            pid = f.read().strip()
+    if pid == str(os.getpid()):
+        return None
+    return int(pid) if pid.isdigit() else -1
+
+# how long a drive keeps running without a new heartbeat
+WATCHDOG_MS = 500
+
+
+def jog_names(i):
+    """The HAL instances that make CSP drive i's pos-cmd."""
+    return "ecatjog%d" % i, "ecatsel%d" % i, "ecatnot%d" % i
+
+
+def used_slaves(cfg):
+    """The slaves of the file the component configures: an unused one has no pins."""
+    return [s for s in cfg.get("slaves") or [] if s.get("unused") is not True]
+
+
+def csp_drives(cfg):
+    """Pin prefixes of the cia402 axes in CSP (a slave's name, or its
+    cia402.axes), which the drive test can move; unused slaves have none."""
+    return [a for s in used_slaves(cfg)
+            if s.get("profile") == "cia402" and (s.get("cia402") or {}).get("mode") == "csp"
+            for a in config.axes(s)]
+
+
+def hal_file(cfg, cfg_path, period):
+    """The test's HAL file."""
+    lines = ["# Written by EtherCAT Setup for its workbench.",
+             "loadrt ecat config=%s" % cfg_path,
+             "loadrt threads name1=servo-thread period1=%d" % period]
+    from . import response
+    drives = csp_drives(cfg)
+    s_load, s_addf, s_nets = response.sampler_hal(cfg)
+    if drives:
+        jogs, sels, nots = zip(*(jog_names(i) for i in range(len(drives))))
+        lines += ["loadrt limit3 names=%s" % ",".join(jogs),
+                  "loadrt mux2 names=%s" % ",".join(sels),
+                  "loadrt not names=%s" % ",".join(nots)] + s_load
+    lines.append("addf ecat.read-all servo-thread")
+    for i, name in enumerate(drives):
+        jog, sel, not_ = jog_names(i)
+        lines += ["addf %s servo-thread" % f for f in (sel, not_, jog)]
+        lines += [
+            "net %s-fb %s.pos-fb => %s.in0" % (jog, name, sel),
+            "net %s-enabled %s.stat-op-enabled => %s.sel %s.in" % (jog, name, sel, not_),
+            "net %s-load %s.out => %s.load" % (jog, not_, jog),
+            "net %s-target %s.out => %s.in" % (jog, sel, jog),
+            "net %s-cmd %s.out => %s.pos-cmd" % (jog, jog, name),
+            # until the drive test sets it: no motion at all
+            "setp %s.maxv 0" % jog]
+    # the response measurement's samplers (response.py): after pos-cmd is made
+    lines += s_addf + s_nets
+    for s in used_slaves(cfg):
+        for a in config.axes(s):
+            lines.append("setp %s.watchdog-ms %d" % (a, WATCHDOG_MS))
+    lines += ["addf ecat.write-all servo-thread", "start", ""]
+    return "\n".join(lines)
+
+
+class TestError(Exception):
+    pass
+
+
+class Pin:
+    __slots__ = ("name", "type", "dir", "value")
+
+    def __init__(self, name, type_, dir_, value):
+        self.name, self.type, self.dir, self.value = name, type_, dir_, value
+
+    def __repr__(self):
+        return "Pin(%s %s %s %s)" % (self.name, self.type, self.dir, self.value)
+
+
+# a data type of the configuration file -> the ethercat tool's
+TOOL_TYPES = {"BOOL": "bool", "SINT": "int8", "INT": "int16", "DINT": "int32", "LINT": "int64",
+              "USINT": "uint8", "UINT": "uint16", "UDINT": "uint32", "ULINT": "uint64",
+              "REAL": "float", "LREAL": "double"}
+
+
+def sdo_write_refused(slave, index, subindex):
+    """Why test mode does not write this object to the slave, or None."""
+    # objects that are commands, not settings (quirk files)
+    why = quirks.command(slave, index)
+    if why:
+        return why
+    for direction in ("outputs", "inputs"):
+        for pdo in (slave.get("process-data") or {}).get(direction) or []:
+            for e in pdo.get("entries") or []:
+                try:
+                    if config.parse_obj(e.get("object")) == (index, subindex):
+                        return "0x%04X:%02X is process data: set its pin instead" % (index, subindex)
+                except ValueError:
+                    pass
+    if slave.get("profile") == "cia402" and any(
+            0x6040 <= index - n * config.AXIS_OFFSET <= 0x67FF for n in range(len(config.axes(slave)))):
+        return "CiA 402 objects of a drive are written only by the workbench's Move card"
+    return None
+
+
+def drives_enabled(cfg, upload):
+    """Names of the CiA 402 drives that are in "Operation enabled" (statusword
+    0x6041 bit 2), read with upload(position, index, subindex, type) -> int or
+    None. A command (zero position, store parameters) is not run while a drive
+    can move."""
+    out = []
+    for s in (cfg or {}).get("slaves") or []:
+        if s.get("profile") != "cia402":
+            continue
+        for n in range(len(config.axes(s))):
+            v = upload(s["position"], 0x6041 + n * config.AXIS_OFFSET, 0, "uint16")
+            if v is not None and int(v) & 4:
+                out.append(s.get("name"))
+                break
+    return out
+
+
+def halcmd(*args, check=True):
+    proc = subprocess.run([HALCMD] + [str(a) for a in args], capture_output=True, text=True,
+                          env=lcnc_env.env())
+    if check and proc.returncode != 0:
+        raise TestError((proc.stderr or proc.stdout).strip() or "halcmd %s failed" % args[0])
+    return proc.stdout
+
+
+# LinuxCNC 2.9's halcmd names the types bit, s32, u32, float (2.10: bool,
+# sint, uint, real) and prints a u32 in hex
+HALCMD_TYPES = {"bit": "bool", "s32": "sint", "u32": "uint", "float": "real",
+                "s64": "sint", "u64": "uint"}
+
+
+def parse_pins(text):
+    """name -> Pin, from "halcmd -s show pin" (or param). The types are
+    given with 2.10's names and integers in decimal, whichever LinuxCNC
+    printed them."""
+    pins = {}
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) >= 5:
+            type_, value = HALCMD_TYPES.get(f[1], f[1]), f[3]
+            if type_ in ("sint", "uint") and value[:2].lower() == "0x":
+                try:
+                    value = str(int(value, 16))
+                except ValueError:
+                    pass
+            pins[f[4]] = Pin(f[4], type_, f[2], value)
+    return pins
+
+
+def hal_running():
+    """True if a HAL session (LinuxCNC or halrun) runs already."""
+    try:
+        text = halcmd("-s", "show", "comp", check=False)
+    except OSError:
+        return False
+    # halcmd lists itself, as halcmd<pid>, even when nothing else runs
+    return any(len(f) >= 3 and not f[2].startswith("halcmd")
+               for f in (line.split() for line in text.splitlines()))
+
+
+def read_only_prefixes(cfg):
+    """Pin prefixes that test mode does not set: CiA 402 drives (moved only
+    in the CiA 402 test mode) and the master."""
+    return tuple(["ecat."] + ["%s." % x for s in cfg.get("slaves") or []
+                              if s.get("profile") == "cia402"
+                              for x in dict.fromkeys([s["name"]] + config.axes(s))])
+
+
+def interface_problem(cfg):
+    """Why the master's network interface cannot work on this computer, or
+    None: not given, not there, or xdp-native on a driver without XDP."""
+    master = cfg.get("master") or {}
+    iface = master.get("interface")
+    if not iface:
+        return ("The master has no network interface. Give the one the bus is on, on the "
+                "Master page (Network interface).")
+    if iface not in netif.interfaces():
+        return "The network interface %s does not exist on this computer." % iface
+    if master.get("transport", "raw") == "xdp-native" and netif.xdp_native(iface) is False:
+        drv = netif.driver(iface)
+        return ("%s%s cannot do xdp-native: choose the transport raw or xdp-skb on the Master "
+                "page." % (iface, " (%s)" % drv if drv else ""))
+    return None
+
+
+class TestRun:
+    watching = False    # True for WatchRun: nothing may be set
+
+    def __init__(self, cfg, period=None):
+        errors = config.check(cfg)
+        if errors:
+            raise TestError("the configuration has errors:\n  " + "\n  ".join(errors))
+        self.cfg = cfg
+        self.period = period or 1000000
+        self.read_only = read_only_prefixes(cfg)
+        self.drives = csp_drives(cfg)
+        # the axes' pin prefixes (a slave's name, or its cia402.axes)
+        self.cia402 = [a for s in cfg.get("slaves") or [] for a in config.axes(s)]
+        self.heartbeat = 0
+        self.proc = None
+        self.dir = None
+        self.log_path = None
+        self.written = {}       # pin -> type, of pins set during the test
+        self.lock = None        # the test lock's file, while the test runs
+
+    # -- start and stop
+
+    def start(self, progress=lambda text: None, timeout=40.0):
+        progress("1/5 Checking that nothing else uses the network card")
+        self.lock = lock_test()
+        try:
+            self._start(progress, timeout)
+        except BaseException:
+            if self.proc is None:
+                unlock_test(self.lock)
+                self.lock = None
+            raise
+
+    def _start(self, progress, timeout):
+        in_way = kernelmaster.conflict(((self.cfg or {}).get("master") or {}).get("interface"),
+                                       device=KERNEL_MASTER, confs=KERNEL_CONFS)
+        if in_way:
+            raise TestError(in_way + "\n" + kernelmaster.FIX)
+        if hal_running():
+            raise TestError("HAL runs already (LinuxCNC or halrun): stop it first")
+        problem = interface_problem(self.cfg)
+        if problem:
+            raise TestError(problem)
+        progress("2/5 Writing the test configuration")
+        remove_old_runs()
+        self.dir = tempfile.mkdtemp(prefix=RUN_PREFIX)
+        cfg_path = os.path.join(self.dir, "ethercat.yaml")
+        config.write(self.cfg, cfg_path)
+        hal_path = os.path.join(self.dir, "test.hal")
+        with open(hal_path, "w") as f:
+            f.write(hal_file(self.cfg, cfg_path, self.period))
+        self.log_path = os.path.join(self.dir, "halrun.log")
+        progress("3/5 Starting halrun and loading the ecat component (log: %s)" % self.log_path)
+        self.log = open(self.log_path, "w")
+        self.proc = subprocess.Popen([HALRUN, "-I", "-f", hal_path], cwd=self.dir,
+                                     stdin=subprocess.PIPE, stdout=self.log,
+                                     stderr=subprocess.STDOUT, text=True,
+                                     env=lcnc_env.env())
+        begin = time.monotonic()
+        end = begin + timeout
+        told = 0
+        while time.monotonic() < end:
+            waited = int(time.monotonic() - begin)
+            if waited > told:
+                told = waited
+                progress("4/5 Bringing the bus up: waiting for the slaves to reach OP (%d s)" % waited)
+            if self.proc.poll() is not None:
+                self._closed()
+                raise TestError("halrun stopped:\n" + self.log_tail())
+            if self._hal_file_failed(hal_path):
+                # halrun -I goes on after an error in the file: end it
+                tail = self.log_tail()
+                self.proc.stdin.close()
+                try:
+                    self.proc.wait(5)
+                except subprocess.TimeoutExpired:
+                    self.proc.terminate()
+                    self.proc.wait(5)
+                self._closed()
+                why = self.ecat_errors()
+                raise TestError("ecat could not be started:\n" + ("\n".join(why) if why else tail))
+            pins = self._try_pins("ecat.0.")
+            if pins.get("ecat.0.all-op") and pins["ecat.0.all-op"].value == "TRUE":
+                progress("5/5 All slaves in OP")
+                return
+            time.sleep(0.25)
+        progress("Not all slaves reached OP in %g s; the test runs anyway" % timeout)
+
+    def _hal_file_failed(self, hal_path):
+        """True when halrun has reported an error in the test's HAL file,
+        such as the component failing to load."""
+        try:
+            with open(self.log_path, errors="replace") as f:
+                return any(line.startswith(hal_path + ":") for line in f)
+        except OSError:
+            return False
+
+    def _try_pins(self, prefix=""):
+        try:
+            return self.pins(prefix)
+        except (TestError, OSError):
+            return {}
+
+    @property
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def stop(self, timeout=20.0):
+        """Put set pins back to 0, stop the thread, unload, end halrun."""
+        if self.proc is None:
+            return
+        if self.running:
+            self.disable_drives()
+            for name, type_ in list(self.written.items()):
+                try:
+                    halcmd("setp", name, "0" if type_ != "bool" else "FALSE")
+                except (TestError, OSError):
+                    pass
+            # let a few cycles carry the zeros out before the thread stops
+            time.sleep(max(0.05, 5 * self.period / 1e9))
+            self.take_down()
+            try:
+                # the thread stops before the master is released (lcec
+                # uses the master's memory from the thread)
+                self.proc.stdin.write("stop\nexit\n")
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            try:
+                self.proc.wait(timeout)
+            except subprocess.TimeoutExpired:
+                self.proc.terminate()
+                self.proc.wait(5)
+        self._closed()
+
+    def take_down(self, timeout=2.0):
+        """Take the slaves to PREOP while process data still flows, as
+        ecat-take-down does at a LinuxCNC shutdown: otherwise they lose it
+        in OP when the thread stops, and stop with an error. Returns True
+        once no slave is above PREOP."""
+        try:
+            halcmd("setp", "ecat.take-down", "TRUE")
+        except (TestError, OSError):
+            return False
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            pins = self._try_pins("ecat.state-")
+            if pins and all(pins.get("ecat.state-" + s) and pins["ecat.state-" + s].value == "FALSE"
+                            for s in ("safeop", "op")):
+                return True
+            time.sleep(0.02)
+        return False
+
+    def disable_drives(self):
+        """Drop every drive's enable."""
+        try:
+            self.setp_many({"%s.enable" % n: "FALSE" for n in self.cia402})
+        except (TestError, OSError):
+            pass
+
+    def tick_watchdogs(self):
+        """Count up the drives' watchdog pins: the heartbeat. Without it a
+        drive is shut down within WATCHDOG_MS."""
+        if not self.cia402 or not self.running:
+            return
+        self.heartbeat = (self.heartbeat + 1) & 0xFFFFFFFF
+        self.setp_many({"%s.watchdog" % n: self.heartbeat for n in self.cia402})
+
+    def setp_many(self, values):
+        """Set several pins or parameters with one halcmd."""
+        if not values:
+            return
+        text = "".join("setp %s %s\n" % (k, v) for k, v in values.items())
+        proc = subprocess.run([HALCMD, "-k", "-f"], input=text, capture_output=True, text=True,
+                          env=lcnc_env.env())
+        if proc.returncode != 0:
+            raise TestError((proc.stderr or proc.stdout).strip() or "halcmd setp failed")
+
+    def _closed(self):
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        self.log.close()
+        self.proc = None
+        self.written = {}
+        unlock_test(self.lock)
+        self.lock = None
+
+    # what ecat says when it gives up, which says nothing on its own
+    NOISE = ("requesting master", "failure, clearing config", "exiting", "returning -")
+
+    def ecat_errors(self):
+        """The component's own messages in the log (the start check's among
+        them), without the lines it adds when it gives up."""
+        try:
+            with open(self.log_path, errors="replace") as f:
+                lines = [x.rstrip("\n") for x in f if x.startswith("ecat: ")]
+        except (OSError, TypeError):
+            return []
+        return [x for x in lines if not x[6:].startswith(self.NOISE)]
+
+    def log_tail(self, lines=15):
+        try:
+            with open(self.log_path, errors="replace") as f:
+                return "".join(f.readlines()[-lines:])
+        except (OSError, TypeError):
+            return ""
+
+    # -- pins
+
+    def pins(self, prefix=""):
+        args = ["-s", "show", "pin"] + ([prefix] if prefix else [])
+        return parse_pins(halcmd(*args))
+
+    def writable(self, pin):
+        return pin.dir == "IN" and not pin.name.startswith(self.read_only)
+
+    def set_pin(self, pin, value):
+        """Set an input pin of the component (an output to a slave)."""
+        if not self.running:
+            raise TestError("the test does not run")
+        if not self.writable(pin):
+            raise TestError("%s cannot be set on the workbench" % pin.name)
+        if pin.type == "bool":
+            text = "TRUE" if value in (True, 1, "1", "TRUE", "true") else "FALSE"
+        elif pin.type == "real":
+            text = repr(float(value))
+        else:
+            text = str(int(value, 0) if isinstance(value, str) else int(value))
+        halcmd("setp", pin.name, text)
+        self.written[pin.name] = pin.type
+
+
+class WatchRun(TestRun):
+    """A LinuxCNC that runs, watched through its HAL: the pins read live,
+    nothing set, nothing started or stopped. It has the TestRun's reading
+    side, so that the Live tab shows the same view; whatever would change
+    something is refused or does nothing."""
+
+    watching = True
+
+    def __init__(self, cfg, period=None):
+        # no check of the configuration: it is what runs that is shown
+        self.cfg = cfg
+        self.period = period or 1000000
+        self.read_only = ("",)
+        self.drives = []
+        self.cia402 = []
+        self.heartbeat = 0
+        self.proc = None
+        self.dir = None
+        self.log_path = None
+        self.written = {}
+        self.lock = None
+        self.gone = False
+        self.missing = []       # slaves of the file without pins in LinuxCNC's HAL
+
+    def start(self, progress=lambda text: None, timeout=40.0):
+        if not hal_running():
+            raise TestError("LinuxCNC does not run: there is no HAL session to watch")
+        pins = self._try_pins("ecat.0.")
+        if "ecat.0.all-op" not in pins:
+            raise TestError("LinuxCNC runs, but the ecat component is not loaded in it")
+        # the slaves are found by their names: another configuration shows nothing
+        names = [x["name"] for x in used_slaves(self.cfg) if x.get("name")]
+        prefixes = {n.split(".", 1)[0] for n in self._try_pins("")}
+        self.missing = [n for n in names if n not in prefixes]
+        if names and len(self.missing) == len(names):
+            raise TestError(
+                "LinuxCNC runs another configuration: none of this one's slaves (%s) has pins "
+                "in its HAL. Open the configuration LinuxCNC runs with: the file its INI file "
+                "names ([ETHERCAT]CONFIG)." % ", ".join(names))
+        progress("Watching LinuxCNC")
+
+    @property
+    def running(self):
+        return not self.gone
+
+    def pins(self, prefix=""):
+        try:
+            out = super().pins(prefix)
+        except (TestError, OSError):
+            out = {}
+        if not out and not hal_running():
+            self.gone = True
+            raise TestError("LinuxCNC's HAL cannot be read: it has stopped")
+        return out
+
+    def writable(self, pin):
+        return False
+
+    def set_pin(self, pin, value):
+        raise TestError("%s: LinuxCNC is only watched; nothing is set" % pin.name)
+
+    def setp_many(self, values):
+        if values:
+            raise TestError("LinuxCNC is only watched; nothing is set")
+
+    def stop(self, timeout=20.0):
+        pass
+
+    def take_down(self, timeout=2.0):
+        return False
+
+    def disable_drives(self):
+        pass
+
+    def tick_watchdogs(self):
+        pass

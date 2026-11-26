@@ -1,0 +1,595 @@
+"""Diagnose the slaves on the bus: why a slave is not in OP, which cable
+or connector has errors, what the slave says about itself, and what a
+CiA 402 drive is missing to run.
+
+Everything here only reads (ESC registers, SDO uploads), so it can run
+against a free-running master or against the master inside a running
+LinuxCNC.
+"""
+
+import time
+from dataclasses import dataclass, field
+
+from . import coe, tool
+
+AL_STATES = {1: "INIT", 2: "PREOP", 3: "BOOT", 4: "SAFEOP", 8: "OP"}
+
+# AL status codes (ETG.1000.6), with what usually lies behind them.
+AL_CODES = {
+    0x0000: ("No error", ""),
+    0x0001: ("Unspecified error", ""),
+    0x0002: ("No memory", ""),
+    0x0011: ("Invalid requested state change",
+             "often a follow-up of an earlier error; restart the master"),
+    0x0012: ("Unknown requested state", ""),
+    0x0013: ("Bootstrap not supported", ""),
+    0x0014: ("No valid firmware", "the slave's firmware must be loaded again"),
+    0x0015: ("Invalid mailbox configuration (BOOT)", ""),
+    0x0016: ("Invalid mailbox configuration", "the SII's mailbox settings are wrong"),
+    0x0017: ("Invalid sync manager configuration",
+             "the process data does not fit the slave: check the mapping, or use "
+             "configure-pdos: false"),
+    0x0018: ("No valid inputs available", ""),
+    0x0019: ("No valid outputs", ""),
+    0x001A: ("Synchronization error", "check the slave's DC settings"),
+    0x001B: ("Sync manager watchdog",
+             "the process data stopped coming: LinuxCNC stopped, or cycles were missed"),
+    0x001C: ("Invalid sync manager types", ""),
+    0x001D: ("Invalid output configuration", "the output mapping is not accepted"),
+    0x001E: ("Invalid input configuration", "the input mapping is not accepted"),
+    0x001F: ("Invalid watchdog configuration", ""),
+    0x0020: ("Slave needs cold start", "switch the slave's power off and on"),
+    0x0021: ("Slave needs INIT", ""),
+    0x0022: ("Slave needs PREOP", ""),
+    0x0023: ("Slave needs SAFEOP", ""),
+    0x0024: ("Invalid input mapping", "the input mapping is not accepted"),
+    0x0025: ("Invalid output mapping", "the output mapping is not accepted"),
+    0x0026: ("Inconsistent settings", "a setting (SDO) does not fit the others"),
+    0x0027: ("Freerun not supported", "the slave needs distributed clocks: give it dc"),
+    0x0028: ("Synchronization not supported", "the slave cannot run with this dc setting"),
+    0x0029: ("Freerun needs 3 buffer mode", ""),
+    0x002A: ("Background watchdog", ""),
+    0x002B: ("No valid inputs and outputs", ""),
+    0x002C: ("Fatal sync error", "SYNC0 stopped or came at the wrong time; check DC"),
+    0x002D: ("No sync error", "SYNC0 does not come: check dc assign-activate"),
+    0x0030: ("Invalid DC SYNC configuration",
+             "the slave does not accept the dc settings: assign-activate, sync0 cycle"),
+    0x0031: ("Invalid DC latch configuration", ""),
+    0x0032: ("PLL error", "the slave's clock does not follow; check the DC settings"),
+    0x0033: ("DC sync IO error", ""),
+    0x0034: ("DC sync timeout error", ""),
+    0x0035: ("DC invalid sync cycle time", "the slave does not support this cycle time"),
+    0x0036: ("DC sync0 cycle time", "the slave does not support this SYNC0 cycle"),
+    0x0037: ("DC sync1 cycle time", ""),
+    0x0041: ("Mailbox AoE", ""),
+    0x0042: ("Mailbox EoE", ""),
+    0x0043: ("Mailbox CoE", "a start-up SDO failed: check the settings"),
+    0x0044: ("Mailbox FoE", ""),
+    0x0045: ("Mailbox SoE", ""),
+    0x004F: ("Mailbox VoE", ""),
+    0x0050: ("EEPROM no access", ""),
+    0x0051: ("EEPROM error", "the slave's SII is damaged"),
+    0x0060: ("Slave restarted locally", "the slave lost power or reset itself"),
+}
+
+# 0x603F error code classes (CiA 301/402).
+ERROR_CLASSES = [
+    (0x2000, "current"), (0x3000, "voltage"), (0x4000, "temperature"),
+    (0x5000, "device hardware"), (0x6000, "device software"), (0x7000, "additional modules"),
+    (0x8000, "monitoring"), (0x9000, "external error"), (0xF000, "additional functions"),
+    (0xFF00, "device specific"),
+]
+ERROR_CODES = {
+    0x2310: "continuous over-current", 0x2320: "short circuit / earth leakage",
+    0x3110: "mains over-voltage", 0x3120: "mains under-voltage", 0x3210: "DC link over-voltage",
+    0x3220: "DC link under-voltage", 0x4210: "excess temperature, device",
+    0x4310: "excess temperature, drive", 0x5112: "supply low voltage",
+    0x7121: "motor blocked", 0x7300: "sensor (encoder)", 0x7305: "incremental sensor 1 fault",
+    0x7500: "communication", 0x8110: "CAN overrun", 0x8400: "velocity speed controller",
+    0x8611: "following error", 0x8612: "reference limit", 0x8700: "sync controller",
+}
+
+CIA402_STATES = [
+    (0x4F, 0x00, "Not ready to switch on", "the drive is starting or testing itself"),
+    (0x4F, 0x40, "Switch on disabled",
+     "waiting for Shutdown (control word 0x06): enable is not set, or a fault was just reset"),
+    (0x6F, 0x21, "Ready to switch on", "waiting for Switch on (control word 0x07): enable is not set"),
+    (0x6F, 0x23, "Switched on", "waiting for Enable operation (0x0F), which the profile sends "
+                                "only in the configured mode"),
+    (0x6F, 0x27, "Operation enabled", ""),
+    (0x6F, 0x07, "Quick stop active", "a quick stop was requested"),
+    (0x4F, 0x0F, "Fault reaction active", "the drive is stopping after a fault"),
+    (0x4F, 0x08, "Fault", "see the error code; reset with fault-reset"),
+]
+MODES = {0: "none", 1: "PP", 3: "PV", 4: "TQ", 6: "HM", 7: "IP", 8: "CSP", 9: "CSV", 10: "CST"}
+
+
+def reg_read(pos, address, length):
+    out = tool.run("reg_read", "-p", pos, "0x%04x" % address, length)
+    return bytes(int(b, 16) for b in out.split())
+
+
+def counters(pos):
+    """Error counters 0x0300-0x0313: per port (rx, phy, forwarded, lost link)."""
+    r = reg_read(pos, 0x0300, 0x14)
+    return [{"rx": r[2 * p], "phy": r[2 * p + 1], "fwd": r[0x08 + p], "lost": r[0x10 + p]}
+            for p in range(4)]
+
+
+def dl_status(pos):
+    """Link and communication per port, from 0x0110."""
+    v = int.from_bytes(reg_read(pos, 0x0110, 2), "little")
+    return [{"link": bool(v >> (4 + p) & 1), "comm": bool(v >> (9 + 2 * p) & 1)} for p in range(4)]
+
+
+def pdi_status(pos):
+    """0x0110 bits 0 and 1: (PDI operational, i.e. the EEPROM loaded and the
+    slave's processor side of the chip set up; PDI watchdog reloaded)."""
+    v = reg_read(pos, 0x0110, 1)[0]
+    return bool(v & 1), bool(v & 2)
+
+
+def esc_errors(pos):
+    """0x030C/0x030D: frames the chip could not process, and errors on the PDI
+    (the bus between the chip and the slave's processor, such as SPI)."""
+    r = reg_read(pos, 0x030C, 2)
+    return {"processing": r[0], "pdi": r[1]}
+
+
+def watchdogs(pos):
+    """The chip's watchdogs, 0x0400-0x0443. Times in ms (0: off); the counters
+    count expiries since power-on (they stop at 255)."""
+    r = reg_read(pos, 0x0400, 0x44)
+    unit_ms = (int.from_bytes(r[0:2], "little") + 2) * 40e-6      # divider: 40 ns ticks
+    return {"pdi_ms": int.from_bytes(r[0x10:0x12], "little") * unit_ms,
+            "pd_ms": int.from_bytes(r[0x20:0x22], "little") * unit_ms,
+            "pd_ok": bool(r[0x40] & 1), "pd_count": r[0x42], "pdi_count": r[0x43]}
+
+
+# ETG.1020 synchronisation objects: 0x1C32 for the outputs, 0x1C33 for the inputs
+SYNC_OBJECTS = {0x1C32: "outputs", 0x1C33: "inputs"}
+SYNC_TYPES = {0: "free run", 1: "synchronous with the SM event", 2: "DC SYNC0", 3: "DC SYNC1",
+              0x22: "synchronous with the outputs' SM event"}
+SYNC_ENTRIES = {"type": (0x01, "uint16"), "cycle_ns": (0x02, "uint32"), "min_cycle_ns": (0x05, "uint32"),
+                "calc_copy_ns": (0x06, "uint32"), "missed": (0x0B, "uint16"),
+                "too_small": (0x0C, "uint16"), "sync_error": (0x20, "uint8")}
+
+
+def sync_values(pos, index, entries):
+    """The ETG.1020 values of 0x1C32 or 0x1C33 the slave lists (entries:
+    {(index, subindex)}); asking for one it does not have makes the master log
+    an abort."""
+    return {k: tool.upload(pos, index, sub, dtype) for k, (sub, dtype) in SYNC_ENTRIES.items()
+            if (index, sub) in entries}
+
+
+def al_status(pos):
+    st = reg_read(pos, 0x0130, 2)[0]
+    code = int.from_bytes(reg_read(pos, 0x0134, 2), "little")
+    return st & 0x0F, bool(st & 0x10), code
+
+
+def cia402_state(sw):
+    for mask, value, name, hint in CIA402_STATES:
+        if sw & mask == value:
+            return name, hint
+    return "unknown", ""
+
+
+def error_text(code):
+    if code == 0:
+        return "no error"
+    name = ERROR_CODES.get(code)
+    cls = next((n for base, n in reversed(ERROR_CLASSES) if code >= base), "")
+    return "0x%04X %s" % (code, name or ("(%s)" % cls if cls else ""))
+
+
+@dataclass
+class Port:
+    number: int
+    link: bool
+    now: dict           # counters since power-on: rx, phy, fwd, lost
+    delta: dict         # how much they grew while watched
+
+    @property
+    def grew(self):
+        """Counters that grew, other than forwarded errors (which only say
+        that the fault is further back)."""
+        return [k for k in ("rx", "phy", "lost") if self.delta[k]]
+
+    @property
+    def saturated(self):
+        """Counters that have run to their limit (255): since then they cannot
+        show whether the fault is still there."""
+        return [k for k in ("rx", "phy", "lost") if self.now[k] == 255]
+
+    @property
+    def shown(self):
+        return self.link or any(self.now.values())
+
+
+@dataclass
+class Cia402:
+    statusword: int = None
+    state: str = ""
+    hint: str = ""
+    mode: object = None             # 0x6061
+    requested: object = None        # 0x6060
+    error_code: int = None          # 0x603F
+
+
+@dataclass
+class Processor:
+    """The slave's own processor (behind the PDI), as its EtherCAT chip sees
+    it: the chip answers the master even when the processor has stopped."""
+    operational: bool = None        # 0x0110 bit 0
+    watchdog_ok: bool = None        # 0x0110 bit 1 (meaningful when pdi_ms > 0)
+    pdi_ms: float = None            # PDI watchdog time, 0: off
+    pdi_expired: int = None         # 0x0443, since power-on
+    pdi_expired_delta: int = 0
+    pd_ms: float = None             # process data watchdog time, 0: off
+    pd_ok: bool = None              # 0x0440 bit 0
+    pd_expired: int = None          # 0x0442
+    pd_expired_delta: int = 0
+    pdi_errors: int = None          # 0x030D
+    pdi_errors_delta: int = 0
+    processing_errors: int = None   # 0x030C
+    processing_errors_delta: int = 0
+
+
+@dataclass
+class SyncInfo:
+    """What the slave says about its synchronisation (ETG.1020)."""
+    index: int                      # 0x1C32 or 0x1C33
+    values: dict                    # SYNC_ENTRIES' keys -> value (None: refused)
+    missed_delta: int = 0           # :0B grew while watched
+    too_small_delta: int = 0        # :0C grew while watched
+
+
+@dataclass
+class Report:
+    """What was found on one slave."""
+    position: int
+    name: str
+    flagged: bool                   # the master's error flag in the slave list
+    state: int                      # AL state: 1, 2, 4, 8
+    error: bool                     # AL error indication
+    code: int                       # AL status code
+    last_code: int = None           # kept by the master when the slave's was cleared
+    ports: list = field(default_factory=list)
+    seconds: float = 0
+    history: list = field(default_factory=list)   # the slave's diagnosis history (0x10F3)
+    error_register: int = None      # 0x1001
+    cia402: Cia402 = None
+    processor: Processor = None
+    sync: list = field(default_factory=list)    # [SyncInfo]
+
+    @property
+    def state_name(self):
+        return AL_STATES.get(self.state, "0x%X" % self.state)
+
+
+def examine(positions, seconds=2.0):
+    """Read the slaves and return a Report for each."""
+    slaves = tool.slave_list()
+    first = {pos: counters(pos) for pos in positions}
+    first_chip = {pos: (_try(lambda: esc_errors(pos)), _try(lambda: watchdogs(pos))) for pos in positions}
+    infos = {pos: _try(lambda: tool.slave_info(pos)) or {} for pos in positions}
+    dicts = {pos: coe.Dictionary(_try(lambda: tool.sdos(pos)) or "") if infos[pos].get("coe") is not False
+             else coe.Dictionary() for pos in positions}
+    first_sync = {pos: {i: sync_values(pos, i, dicts[pos].entries) for i in SYNC_OBJECTS}
+                  for pos in positions}
+    if seconds > 0:
+        time.sleep(seconds)
+    reports = []
+    for pos in positions:
+        name, flagged = slaves.get(pos, ("", False))
+        state, err, code = al_status(pos)
+        r = Report(pos, name, flagged, state, err, code, seconds=seconds)
+        info = infos[pos]
+        if flagged and not err and state != 8:
+            r.last_code = info.get("al_status_code")
+        dl, now, then = dl_status(pos), counters(pos), first[pos]
+        for p in range(4):
+            r.ports.append(Port(p, dl[p]["link"], now[p],
+                                {k: (now[p][k] - then[p][k]) % 256 for k in now[p]}))
+        r.processor = _processor(pos, *first_chip[pos])
+        for index in SYNC_OBJECTS:
+            was = first_sync[pos][index]
+            if not was:
+                continue
+            v = sync_values(pos, index, dicts[pos].entries)
+            s = SyncInfo(index, v)
+            for key, attr in (("missed", "missed_delta"), ("too_small", "too_small_delta")):
+                if v.get(key) is not None and was.get(key) is not None:
+                    setattr(s, attr, (v[key] - was[key]) % 65536)
+            r.sync.append(s)
+        # a slave without CoE is not asked at all, and one with CoE only for the
+        # objects it lists: the master logs an error for each other request
+        # ("Slave does not support CoE!", an abort). An empty listing (not
+        # read yet) asks as before.
+        if info.get("coe") is False:
+            reports.append(r)
+            continue
+        objects = dicts[pos].objects
+
+        def listed(index):
+            return not objects or index in objects
+        diag = _try(lambda: tool.run("diag", "-p", pos)) if listed(0x10F3) else None
+        if diag and "does not provide" not in diag:
+            r.history = diag.strip().splitlines()
+        if listed(0x1001):
+            r.error_register = tool.upload(pos, 0x1001, 0, "uint8")
+        dt = tool.upload(pos, 0x1000, 0, "uint32") if listed(0x1000) else None
+        if dt is not None and dt & 0xFFFF == 402:
+            c = r.cia402 = Cia402()
+            c.statusword = tool.upload(pos, 0x6041, 0, "uint16")
+            if c.statusword is not None:
+                c.state, c.hint = cia402_state(c.statusword)
+                c.mode = tool.upload(pos, 0x6061, 0, "int8")
+                c.requested = tool.upload(pos, 0x6060, 0, "int8")
+                c.error_code = tool.upload(pos, 0x603F, 0, "uint16")
+        reports.append(r)
+    return reports
+
+
+def _processor(pos, errors_before, watchdogs_before):
+    """Processor from the chip's registers now and before the watch."""
+    p = Processor()
+    pdi = _try(lambda: pdi_status(pos))
+    if pdi is not None:
+        p.operational, p.watchdog_ok = pdi
+    e, w = _try(lambda: esc_errors(pos)), _try(lambda: watchdogs(pos))
+    if e is not None:
+        p.pdi_errors, p.processing_errors = e["pdi"], e["processing"]
+        if errors_before is not None:
+            p.pdi_errors_delta = (e["pdi"] - errors_before["pdi"]) % 256
+            p.processing_errors_delta = (e["processing"] - errors_before["processing"]) % 256
+    if w is not None:
+        p.pdi_ms, p.pd_ms, p.pd_ok = w["pdi_ms"], w["pd_ms"], w["pd_ok"]
+        p.pdi_expired, p.pd_expired = w["pdi_count"], w["pd_count"]
+        if watchdogs_before is not None:
+            p.pdi_expired_delta = (w["pdi_count"] - watchdogs_before["pdi_count"]) % 256
+            p.pd_expired_delta = (w["pd_count"] - watchdogs_before["pd_count"]) % 256
+    return p
+
+
+def processor_findings(p, state, seconds):
+    """(problems, lines) about the slave's own processor; lines starting with
+    "->" are problems, "Note:" are worth knowing; nothing when all is well."""
+    if p is None:
+        return 0, []
+    lines, problems = [], 0
+    if p.operational is False:
+        problems += 1
+        lines.append("-> the slave's processor side of the EtherCAT chip is not running (PDI not "
+                     "operational, 0x0110): the EEPROM was not loaded, its PDI settings do not fit "
+                     "the board, or the firmware has not set it up")
+    elif p.pdi_ms and p.watchdog_ok is False:
+        problems += 1
+        lines.append("-> the slave's processor has stopped talking to its EtherCAT chip (PDI watchdog "
+                     "of %g ms expired, 0x0110): its firmware hangs, crashed or restarts. The chip "
+                     "still answers, so the cable is not the cause" % p.pdi_ms)
+    if p.pdi_expired_delta:
+        problems += 1
+        lines.append("-> the PDI watchdog expired %d times in %g s (0x0443): the processor stops "
+                     "answering now and then" % (p.pdi_expired_delta, seconds))
+    elif p.pdi_expired:
+        lines.append("Note: the PDI watchdog expired %s times since power-on (0x0443), not while "
+                     "watched" % _count(p.pdi_expired))
+    if p.pdi_errors_delta:
+        problems += 1
+        lines.append("-> errors on the bus between the EtherCAT chip and the processor (PDI, such as "
+                     "SPI) grew by %d in %g s (0x030D): its wiring, clock or timing"
+                     % (p.pdi_errors_delta, seconds))
+    elif p.pdi_errors:
+        lines.append("Note: %s PDI errors since power-on (0x030D), not while watched" % _count(p.pdi_errors))
+    if p.processing_errors_delta:
+        problems += 1
+        lines.append("-> the chip got %d frames it could not process in %g s (0x030C)"
+                     % (p.processing_errors_delta, seconds))
+    if state == 8 and p.pd_ms and p.pd_expired_delta:
+        problems += 1
+        lines.append("-> the process data watchdog (%g ms) expired %d times in %g s (0x0442): the "
+                     "outputs did not come in time (the master's cycle, or frames lost)"
+                     % (p.pd_ms, p.pd_expired_delta, seconds))
+    return problems, lines
+
+
+def _dur(ns):
+    """A time in ns in the unit that fits."""
+    if ns < 1000:
+        return "%d ns" % ns
+    if ns < 1000000:
+        return "%g us" % round(ns / 1e3, 1)
+    return "%g ms" % round(ns / 1e6, 3)
+
+
+def sync_findings(s, state, seconds):
+    """(problems, lines) about the slave's synchronisation (0x1C32/0x1C33)."""
+    v, lines, problems = s.values, [], 0
+    parts = []
+    if v.get("type") is not None:
+        parts.append(SYNC_TYPES.get(v["type"], "type 0x%02X" % v["type"]))
+    if v.get("cycle_ns"):
+        parts.append("cycle " + _dur(v["cycle_ns"]))
+    if v.get("calc_copy_ns"):
+        parts.append("its own work %s" % _dur(v["calc_copy_ns"]))
+    if v.get("min_cycle_ns"):
+        # some slaves report a value they cannot mean (the ECT60: 0xE8480000, 3.9 s)
+        odd = state == 8 and v.get("cycle_ns") and v["min_cycle_ns"] > v["cycle_ns"] \
+            and not s.too_small_delta
+        parts.append("shortest cycle %s%s" % (_dur(v["min_cycle_ns"]),
+                                              " (as reported; it runs at a shorter one)" if odd else ""))
+    lines.append("Sync (0x%04X, %s): %s" % (s.index, SYNC_OBJECTS[s.index], ", ".join(parts) or "-"))
+    if s.missed_delta:
+        problems += 1
+        lines.append("-> %d cycles without new process data in %g s (0x%04X:0B SM event missed): the "
+                     "frame came after the slave's cycle started (the master's timing, the SYNC0 "
+                     "shift, or frames lost)" % (s.missed_delta, seconds, s.index))
+    if s.too_small_delta:
+        problems += 1
+        lines.append("-> %d cycles were too short for the slave in %g s (0x%04X:0C): its work does not "
+                     "fit in the cycle" % (s.too_small_delta, seconds, s.index))
+    if v.get("calc_copy_ns") and v.get("cycle_ns") and v["calc_copy_ns"] > v["cycle_ns"]:
+        problems += 1
+        lines.append("-> the slave needs %s but the cycle is %s: a longer cycle is needed"
+                     % (_dur(v["calc_copy_ns"]), _dur(v["cycle_ns"])))
+    if state == 8 and v.get("sync_error"):
+        problems += 1
+        lines.append("-> the slave reports a synchronisation error (0x%04X:20)" % s.index)
+    return problems, lines
+
+
+def cia402_findings(c):
+    """(problems, lines) about a drive."""
+    if c.statusword is None:
+        return 1, ["CiA 402: the status word 0x6041 cannot be read"]
+    sw, lines, problems = c.statusword, [], 0
+    lines.append("CiA 402: %s (status word 0x%04X), mode %s%s" % (
+        c.state, sw, MODES.get(c.mode, c.mode),
+        "" if c.requested in (None, c.mode) else ", requested %s" % MODES.get(c.requested, c.requested)))
+    if c.hint:
+        lines.append("  -> %s" % c.hint)
+    if c.error_code:
+        problems += 1
+        lines.append("Error code 0x603F: %s" % error_text(c.error_code))
+    if not sw & (1 << 4) and c.state in ("Switched on", "Operation enabled"):
+        problems += 1
+        lines.append("  -> no voltage on the power stage (status word bit 4): check the main power")
+    if not sw & (1 << 9):
+        problems += 1
+        lines.append("  -> not remote (bit 9): the drive is set to local control, the bus cannot run it")
+    if sw & (1 << 7):
+        lines.append("  -> warning bit set (bit 7)")
+    if c.state == "Fault":
+        problems += 1
+    return problems, lines
+
+
+def diagnose(positions, seconds=2.0, out=print):
+    """Report on the slaves; return the number of problems found."""
+    problems = 0
+    reports = examine(positions, seconds)
+    for r in reports:
+        out("Slave %d: %s" % (r.position, r.name))
+
+        # application layer state
+        text, hint = AL_CODES.get(r.code, ("unknown code", ""))
+        line = "  State: %s" % r.state_name
+        if r.error or r.state != 8:
+            problems += 1
+            line += ", error 0x%04X: %s" % (r.code, text) if r.error else " (not OP)"
+        out(line)
+        if r.error and hint:
+            out("    -> %s" % hint)
+        elif r.flagged and not r.error and r.state != 8:
+            if r.last_code:
+                text, hint = AL_CODES.get(r.last_code, ("unknown code", ""))
+                out("    -> refused with 0x%04X: %s (kept by the master; the slave's own code was "
+                    "cleared when the master acknowledged the error)" % (r.last_code, text))
+                if hint:
+                    out("    -> %s" % hint)
+            else:
+                out("    -> no AL status code: the master gave up bringing the slave up (such as a "
+                    "DC setting it cannot take), or the slave refused and acknowledging the error "
+                    "cleared its code; the master's messages say which")
+
+        # links and error counters
+        for port in r.ports:
+            if not port.shown:
+                continue
+            total = ", ".join("%s %s" % (k, _count(port.now[k])) for k in ("rx", "phy", "lost")
+                              if port.now[k])
+            out("  Port %d: %s%s" % (port.number, "link" if port.link else "no link",
+                                     "; since power-on: " + total if total else ""))
+            if port.grew:
+                problems += 1
+                out("    -> %s increased by %s in %g s: the cable or connector at this port, "
+                    "or the device on its other end"
+                    % (" and ".join(port.grew), "/".join(str(port.delta[k]) for k in port.grew),
+                       seconds))
+            elif port.delta["fwd"]:
+                out("    -> forwarded errors increased: the fault is before this slave")
+            if port.saturated:
+                out("    Note: %s at its limit (255+): it cannot show whether the fault is still "
+                    "there. Write to the counter's register (0x0300 for rx and phy errors, "
+                    "0x0310 for lost links) or power the slave off, then run this again"
+                    % " and ".join(port.saturated))
+
+        # the slave's processor and its synchronisation
+        n, lines = processor_findings(r.processor, r.state, seconds)
+        problems += n
+        if lines:
+            out("  The slave's processor (behind the PDI):")
+            for line in lines:
+                out("    " + line)
+        for s in r.sync:
+            n, lines = sync_findings(s, r.state, seconds)
+            problems += n
+            out("  " + lines[0])
+            for line in lines[1:]:
+                out("    " + line)
+
+        # the slave's own messages
+        if r.history:
+            out("  Diagnosis history (0x10F3):")
+            for line in r.history[-10:]:
+                out("    " + line)
+        if r.error_register:
+            problems += 1
+            out("  Error register 0x1001: 0x%02X" % r.error_register)
+
+        if r.cia402 is not None:
+            n, lines = cia402_findings(r.cia402)
+            problems += n
+            for line in lines:
+                out("  " + line)
+
+        # what the master said about it while ecat ran (the flight recorder)
+        from . import events
+        path, said = events.slave_messages(r.position)
+        if said:
+            out("  Messages from the master%s:" % (" (the run before)" if path.endswith(".prev")
+                                                   else ""))
+            for t, n in said[-10:]:
+                out("    %s %s%s" % (events.stamp(t.time), t.text,
+                                     " (%d times)" % n if n > 1 else ""))
+        out("")
+    for line in lost_link_notes(reports):
+        out(line)
+    return problems
+
+
+def lost_link_notes(reports):
+    """Notes on cables that lost their link since power-on: the same count of
+    lost links (not a saturated one) on the ports at both ends of a cable.
+    Not problems by themselves: the counters are never cleared by the master."""
+    notes = []
+    by_pos = {r.position: r for r in reports}
+    for r in reports:
+        nxt = by_pos.get(r.position + 1)
+        if nxt is None:
+            continue
+        for a in r.ports:
+            for b in nxt.ports:
+                if 0 < a.now["lost"] < 255 and 0 < b.now["lost"] < 255 and a.now["lost"] == b.now["lost"] \
+                        and a.number != 0 and b.number == 0:
+                    notes.append("Note: the link was lost %d time%s since power-on between slave %d port %d "
+                                 "and slave %d port %d: that cable was disconnected, loose or the slave "
+                                 "behind it lost power (the counters are not cleared; a cable "
+                                 "pulled on purpose counts too)"
+                                 % (a.now["lost"], "" if a.now["lost"] == 1 else "s", r.position, a.number,
+                                    nxt.position, b.number))
+    return notes
+
+
+def _count(v):
+    return "255+" if v == 255 else str(v)
+
+
+def _try(f):
+    try:
+        return f()
+    except tool.ToolError:
+        return None

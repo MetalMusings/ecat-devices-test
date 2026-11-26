@@ -1,0 +1,615 @@
+"""Read ESI files (EtherCAT Slave Information, the vendor's XML) and find the
+device description that matches a slave."""
+
+import os
+import pickle
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+
+from . import coe
+
+
+def number(text):
+    """ESI numbers are decimal or "#x" hexadecimal."""
+    if text is None:
+        return None
+    text = text.strip()
+    if text.lower().startswith("#x"):
+        return int(text[2:], 16)
+    return int(text, 0) if text.lower().startswith("0x") else int(text)
+
+
+@dataclass
+class EsiEntry:
+    index: int
+    subindex: int
+    bitlen: int
+    name: str
+    data_type: str
+
+
+@dataclass
+class EsiPdo:
+    index: int
+    direction: str       # "rx" or "tx"
+    sm: int              # assigned by default to this SM, or None
+    fixed: bool
+    mandatory: bool
+    name: str
+    entries: list = field(default_factory=list)
+    excludes: list = field(default_factory=list)
+
+
+@dataclass
+class EsiPdoSet:
+    """A predefined PDO assignment (AlternativeSmMapping), as TwinCAT offers."""
+    name: str
+    default: bool
+    sms: dict            # sync manager -> PDO indexes
+
+
+@dataclass
+class EsiModule:
+    """A module of a modular device (Descriptions/Modules/Module): its PDOs and InitCmds.
+    `slot_pdo`/`slot_index`: per PDO index / per entry or InitCmd index whether it moves
+    with the slot (DependOnSlot) or the slot group (DependOnSlotGroup)."""
+    ident: int
+    name: str
+    pdos: list = field(default_factory=list)        # EsiPdo, indexes as the file has them
+    init_cmds: list = field(default_factory=list)   # (transition, index, subindex, data, complete, (slot, group))
+    pdo_moves: dict = field(default_factory=dict)   # PDO position in pdos -> (with the slot, with the group)
+    entry_moves: dict = field(default_factory=dict)  # (PDO position, entry position) -> (slot, group)
+
+
+@dataclass
+class EsiSlot:
+    name: str
+    idents: list                 # the module idents it takes
+    default: int = None          # the ident marked Default
+    min: int = 1
+    max: int = 1
+    group: int = 0
+    pdo_increment: int = None    # the slot's own, over the device's
+    index_increment: int = None
+    group_pdo_increment: int = None
+    group_index_increment: int = None
+
+
+@dataclass
+class EsiSlots:
+    slots: list = field(default_factory=list)
+    pdo_increment: int = 0
+    index_increment: int = 0
+    group_pdo_increment: int = 0
+    group_index_increment: int = 0
+    download_ident_list: bool = False    # 0xF030 is written to the device
+    modules: dict = field(default_factory=dict)   # ident -> EsiModule (the file's)
+
+
+@dataclass
+class EsiDcMode:
+    name: str
+    desc: str
+    assign_activate: int
+    sync0_factor: int
+    shift0: int
+    sync1_ns: int = 0       # CycleTimeSync1: a fixed SYNC1 cycle in ns (0: by sync1_factor)
+    sync1_factor: int = 0   # CycleTimeSync1@Factor: >0 times the SYNC0 cycle, <0 times the bus cycle
+    shift1: int = 0         # ShiftTimeSync1: SYNC1 after SYNC0, ns
+
+
+@dataclass
+class EsiDevice:
+    path: str
+    vendor_id: int
+    product_code: int
+    revision: int
+    type_name: str
+    name: str
+    profile: int = None
+    pdos: list = field(default_factory=list)
+    dc_modes: list = field(default_factory=list)
+    init_cmds: list = field(default_factory=list)   # (transition, index, subindex, data hex, complete access)
+    pdo_sets: list = field(default_factory=list)
+    pdo_config: bool = None   # <CoE PdoConfig>: the master may change a PDO's entries
+    pdo_assign: bool = None   # <CoE PdoAssign>: the master may change the SM assignment
+    sdo_info: bool = None     # <CoE SdoInfo>: the slave can list its dictionary
+    mapping: dict = field(default_factory=dict)       # object index -> "R", "T" or "RT"
+    max_entries: dict = field(default_factory=dict)   # PDO index -> most entries it takes
+    drive_modes: int = None   # default of 0x6502 (supported drive modes)
+    channels: list = field(default_factory=list)   # (ProfileNo, AddInfo) per ChannelInfo
+    state_timeouts: dict = field(default_factory=dict)  # Info/StateMachine/Timeout, ms by file key
+    sdo_timeout: int = None   # Info/Mailbox/Timeout/ResponseTimeout, ms
+    slots: EsiSlots = None    # a modular device's Slots, with the file's Modules
+
+    @property
+    def sub_profiles(self):
+        """The sub-profile numbers (ETG.2000 AddInfo) the device lists, such as 511."""
+        return {a for _p, a in self.channels if a is not None}
+
+
+def _text(el, path):
+    found = el.find(path)
+    return found.text.strip() if found is not None and found.text else ""
+
+
+def _device(path, vendor_id, dev):
+    t = dev.find("Type")
+    d = EsiDevice(path, vendor_id, number(t.get("ProductCode")),
+                  number(t.get("RevisionNo") or "0"), (t.text or "").strip(),
+                  _text(dev, "Name"))
+    # ETG.2000: the profile number directly under Profile, or per channel
+    # (Profile/ChannelInfo/ProfileNo, as StepperOnline's A6 has it)
+    prof = dev.find("Profile/ProfileNo")
+    if prof is None:
+        prof = dev.find("Profile/ChannelInfo/ProfileNo")
+    if prof is not None and prof.text:
+        d.profile = number(prof.text)
+    for tag, direction in (("RxPdo", "rx"), ("TxPdo", "tx")):
+        for p in dev.findall(tag):
+            pdo = EsiPdo(number(_text(p, "Index")), direction,
+                         number(p.get("Sm")) if p.get("Sm") else None,
+                         p.get("Fixed") in ("1", "true"),
+                         p.get("Mandatory") in ("1", "true"), _text(p, "Name"))
+            for e in p.findall("Entry"):
+                pdo.entries.append(EsiEntry(number(_text(e, "Index")),
+                                            number(_text(e, "SubIndex") or "0"),
+                                            number(_text(e, "BitLen")),
+                                            _text(e, "Name"), _text(e, "DataType")))
+            pdo.excludes = [number(x.text) for x in p.findall("Exclude") if x.text]
+            d.pdos.append(pdo)
+    for m in dev.findall("Dc/OpMode"):
+        c0 = m.find("CycleTimeSync0")
+        c1 = m.find("CycleTimeSync1")
+        d.dc_modes.append(EsiDcMode(
+            _text(m, "Name"), _text(m, "Desc"),
+            number(_text(m, "AssignActivate") or "0"),
+            number(c0.get("Factor")) if c0 is not None and c0.get("Factor") else 1,
+            number(_text(m, "ShiftTimeSync0") or "0"),
+            number(_text(m, "CycleTimeSync1") or "0"),
+            number(c1.get("Factor")) if c1 is not None and c1.get("Factor") else 0,
+            number(_text(m, "ShiftTimeSync1") or "0")))
+    for a in dev.findall("Info/VendorSpecific/TwinCAT/AlternativeSmMapping"):
+        sms = {}
+        for sm in a.findall("Sm"):
+            sms[number(sm.get("No"))] = [number(x.text) for x in sm.findall("Pdo") if x.text]
+        d.pdo_sets.append(EsiPdoSet(_text(a, "Name"), a.get("Default") in ("1", "true"), sms))
+    coe_el = dev.find("Mailbox/CoE")
+    if coe_el is not None:
+        for attr, name in (("PdoConfig", "pdo_config"), ("PdoAssign", "pdo_assign"),
+                           ("SdoInfo", "sdo_info")):
+            if coe_el.get(attr) is not None:
+                setattr(d, name, coe_el.get(attr) in ("1", "true"))
+    _mapping_facts(d, dev)
+    for tag, key in (("PreopTimeout", "preop"), ("SafeopOpTimeout", "safeop-op"),
+                     ("BackToInitTimeout", "back-to-init"), ("BackToSafeopTimeout", "back-to-safeop")):
+        try:
+            v = number(_text(dev, "Info/StateMachine/Timeout/" + tag) or None)
+        except (TypeError, ValueError):
+            v = None
+        if v:
+            d.state_timeouts[key] = v
+    try:
+        d.sdo_timeout = number(_text(dev, "Info/Mailbox/Timeout/ResponseTimeout") or None)
+    except (TypeError, ValueError):
+        d.sdo_timeout = None
+    for c in dev.findall("Profile/ChannelInfo"):
+        try:
+            d.channels.append((number(_text(c, "ProfileNo") or None), number(_text(c, "AddInfo") or None)))
+        except (TypeError, ValueError):
+            pass
+    for c in dev.findall("Mailbox/CoE/InitCmd"):
+        d.init_cmds.append((",".join(t.text for t in c.findall("Transition")),
+                            number(_text(c, "Index")), number(_text(c, "SubIndex") or "0"),
+                            _text(c, "Data"), c.get("CompleteAccess") in ("1", "true")))
+    return d
+
+
+def _mapping_facts(d, dev):
+    """From the dictionary: which objects may be mapped (Flags/PdoMapping),
+    how many entries a PDO object takes (MaxValue of its subindex 0) and the
+    default of 0x6502."""
+    for o in dev.findall("Profile/Dictionary/Objects/Object"):
+        try:
+            index = number(_text(o, "Index"))
+        except (TypeError, ValueError):
+            continue
+        flag = _text(o, "Flags/PdoMapping").upper()
+        if flag:
+            d.mapping[index] = flag
+        if 0x1600 <= index < 0x1C00:
+            for sub in o.findall("Info/SubItem")[:1]:
+                try:
+                    top = _text(sub, "Info/MaxValue")
+                    if top:
+                        d.max_entries[index] = number(top)     # decimal unless #x (ETG.2000 HexDecValue)
+                except (TypeError, ValueError):
+                    pass
+        if index == 0x6502:
+            try:
+                d.drive_modes = number(_text(o, "Info/DefaultValue"))
+            except (TypeError, ValueError):
+                pass
+    # an object whose subitem 0 sits in the data type (as the A6's DT1600 does)
+    types = {_text(x, "Name"): x for x in dev.findall("Profile/Dictionary/DataTypes/DataType")}
+    for o in dev.findall("Profile/Dictionary/Objects/Object"):
+        try:
+            index = number(_text(o, "Index"))
+        except (TypeError, ValueError):
+            continue
+        if index in d.max_entries or not (0x1600 <= index < 0x1800 or 0x1A00 <= index < 0x1C00):
+            continue
+        dt = types.get(_text(o, "Type"))
+        sub = dt.find("SubItem/Info/MaxValue") if dt is not None else None
+        if sub is not None and sub.text:
+            try:
+                d.max_entries[index] = number(sub.text)
+            except ValueError:
+                pass
+
+
+def _moves(el):
+    """(with the slot, with the slot group) of an Index element (ETG.2000 tables 67, 94)."""
+    if el is None:
+        return (False, False)
+    return (el.get("DependOnSlot") in ("1", "true"), el.get("DependOnSlotGroup") in ("1", "true"))
+
+
+def _pdo(p, direction):
+    pdo = EsiPdo(number(_text(p, "Index")), direction,
+                 number(p.get("Sm")) if p.get("Sm") else None,
+                 p.get("Fixed") in ("1", "true"), p.get("Mandatory") in ("1", "true"), _text(p, "Name"))
+    for e in p.findall("Entry"):
+        pdo.entries.append(EsiEntry(number(_text(e, "Index")), number(_text(e, "SubIndex") or "0"),
+                                    number(_text(e, "BitLen")), _text(e, "Name"), _text(e, "DataType")))
+    pdo.excludes = [number(x.text) for x in p.findall("Exclude") if x.text]
+    return pdo
+
+
+def _modules(root):
+    """The file's Descriptions/Modules: ident -> EsiModule."""
+    out = {}
+    for m in root.findall("Descriptions/Modules/Module"):
+        t = m.find("Type")
+        try:
+            mod = EsiModule(number(t.get("ModuleIdent") or "0"), _text(m, "Name") or (t.text or "").strip())
+            for tag, direction in (("RxPdo", "rx"), ("TxPdo", "tx")):
+                for p in m.findall(tag):
+                    pdo = _pdo(p, direction)
+                    mod.pdos.append(pdo)
+                    mod.pdo_moves[len(mod.pdos) - 1] = _moves(p.find("Index"))
+                    for k, e in enumerate(p.findall("Entry")):
+                        mod.entry_moves[(len(mod.pdos) - 1, k)] = _moves(e.find("Index"))
+            for c in m.findall("Mailbox/CoE/InitCmd"):
+                mod.init_cmds.append((",".join(x.text for x in c.findall("Transition")),
+                                      number(_text(c, "Index")), number(_text(c, "SubIndex") or "0"),
+                                      _text(c, "Data"), c.get("CompleteAccess") in ("1", "true"),
+                                      _moves(c.find("Index"))))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        out[mod.ident] = mod
+    return out
+
+
+def _slots(dev, modules):
+    el = dev.find("Slots")
+    if el is None:
+        return None
+
+    def num(x, attr):
+        v = x.get(attr)
+        return number(v) if v not in (None, "") else None
+    out = EsiSlots(pdo_increment=num(el, "SlotPdoIncrement") or 0,
+                   index_increment=num(el, "SlotIndexIncrement") or 0,
+                   group_pdo_increment=num(el, "SlotGroupPdoIncrement") or 0,
+                   group_index_increment=num(el, "SlotGroupIndexIncrement") or 0,
+                   download_ident_list=el.get("DownloadModuleIdentList") in ("1", "true"),
+                   modules=modules)
+    for sl in el.findall("Slot"):
+        idents = [number(x.text) for x in sl.findall("ModuleIdent") if x.text]
+        default = next((number(x.text) for x in sl.findall("ModuleIdent")
+                        if x.text and x.get("Default") in ("1", "true")), None)
+        out.slots.append(EsiSlot(_text(sl, "Name"), idents, default,
+                                 num(sl, "MinInstances") if num(sl, "MinInstances") is not None else 1,
+                                 num(sl, "MaxInstances") if num(sl, "MaxInstances") is not None else 1,
+                                 num(sl, "SlotGroup") or 0, num(sl, "SlotPdoIncrement"),
+                                 num(sl, "SlotIndexIncrement"), num(sl, "SlotGroupPdoIncrement"),
+                                 num(sl, "SlotGroupIndexIncrement")))
+    return out
+
+
+def load_file(path):
+    """All device descriptions in one ESI file. Broken files give none."""
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    if root.tag != "EtherCATInfo":
+        return []
+    vendor = number(_text(root, "Vendor/Id") or "0")
+    devices = []
+    modules = None
+    for dev in root.findall("Descriptions/Devices/Device"):
+        try:
+            d = _device(path, vendor, dev)
+            if dev.find("Slots") is not None:
+                if modules is None:
+                    modules = _modules(root)     # shared by the file's devices
+                d.slots = _slots(dev, modules)
+            devices.append(d)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return devices
+
+
+# Parsed files are kept between runs: Beckhoff's set alone is 1.2 GB of XML
+# and took 50 s to read at every start. An entry is used while its file has
+# the same size and modification time; CACHE_VERSION changes when what is read
+# from a file changes.
+CACHE_VERSION = 9
+
+
+def cache_path():
+    """Where the parsed ESI files are kept ("" for nowhere)."""
+    if "ECATSETUP_ESI_CACHE" in os.environ:
+        return os.environ["ECATSETUP_ESI_CACHE"]
+    if os.environ.get("ECATSETUP_TEST_STATE"):
+        return os.path.join(os.environ["ECATSETUP_TEST_STATE"], "esi-cache.pickle")
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "ecatsetup", "esi-cache.pickle")
+
+
+_cache_mem = {}      # path -> (size and time of the cache file, its files): read once
+
+
+def _read_cache(path):
+    try:
+        st = os.stat(path)
+        stamp = (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return {}
+    mem = _cache_mem.get(path)
+    if mem is not None and mem[0] == (stamp, CACHE_VERSION):
+        return mem[1]
+    files = _load_cache(path)
+    _cache_mem[path] = ((stamp, CACHE_VERSION), files)
+    return files
+
+
+def _load_cache(path):
+    try:
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+    except (OSError, EOFError, pickle.PickleError, AttributeError, ImportError, TypeError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get("version") != CACHE_VERSION:
+        return {}
+    return data.get("files") or {}
+
+
+def _write_cache(path, files):
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump({"version": CACHE_VERSION, "files": files}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+        st = os.stat(path)
+        _cache_mem[path] = (((st.st_size, st.st_mtime_ns), CACHE_VERSION), files)
+    except OSError:
+        pass        # only slower next time
+
+
+def _names(paths):
+    names = []
+    for p in paths:
+        if os.path.isdir(p):
+            for dirpath, _dirs, files in os.walk(p):
+                names += [os.path.join(dirpath, f) for f in sorted(files) if f.lower().endswith(".xml")]
+        else:
+            names.append(p)
+    return names
+
+
+def _stamp(name):
+    try:
+        st = os.stat(name)
+        return st.st_size, st.st_mtime_ns
+    except OSError:
+        return None
+
+
+def uncached(paths):
+    """(files, bytes) that load_dirs would have to parse, not take from the cache."""
+    where = cache_path()
+    old = _read_cache(where) if where else {}
+    n = size = 0
+    for name in _names(paths):
+        stamp = _stamp(name)
+        hit = old.get(os.path.abspath(name))
+        if stamp is not None and (hit is None or hit[0] != stamp):
+            n += 1
+            size += stamp[0]
+    return n, size
+
+
+def load_dirs(paths):
+    """All device descriptions in the given files and folders (recursively),
+    from the cache where a file has not changed since it was read."""
+    names = _names(paths)
+    where = cache_path()
+    old = _read_cache(where) if where else {}
+    new, devices, changed = {}, [], False
+    for name in names:
+        key = os.path.abspath(name)
+        stamp = _stamp(name)
+        hit = old.get(key)
+        if stamp is not None and hit is not None and hit[0] == stamp:
+            found = hit[1]
+        else:
+            found = load_file(name)
+            changed = True
+        if stamp is not None:
+            new[key] = (stamp, found)
+        devices.extend(found)
+    # files read before and not asked for now are kept: another folder list may need them
+    for key, hit in old.items():
+        if key not in new and os.path.exists(key):
+            new[key] = hit
+        elif key not in new:
+            changed = True
+    if where and changed:
+        _write_cache(where, new)
+    return devices
+
+
+def find(devices, vendor_id, product_code, revision):
+    """The best description for a slave: exact revision, else the same product.
+
+    Returns (device or None, exact match).
+    """
+    same = [d for d in devices if d.vendor_id == vendor_id and d.product_code == product_code]
+    for d in same:
+        if d.revision == revision:
+            return d, True
+    if same:
+        return max(same, key=lambda d: d.revision), False
+    return None, False
+
+
+# ESI data type names as the ethercat tool names them (coe.py, propose.COE_TYPES)
+_TOOL_TYPES = {"BOOL": "bool", "BIT": "bool", "SINT": "int8", "INT": "int16", "DINT": "int32",
+               "LINT": "int64", "USINT": "uint8", "BYTE": "uint8", "UINT": "uint16",
+               "WORD": "uint16", "UDINT": "uint32", "DWORD": "uint32", "ULINT": "uint64",
+               "REAL": "float", "LREAL": "double"}
+_SIGNED = {"int8", "int16", "int32", "int64"}
+
+
+def _tool_type(name):
+    name = (name or "").strip()
+    if name.upper().startswith("STRING"):
+        return "string"
+    if name.upper().startswith("BIT") and name[3:].isdigit():
+        return "uint8"
+    return _TOOL_TYPES.get(name.upper(), name.lower())
+
+
+def _access(el):
+    """The six-character access string of the tool ("rwrwrw": read and
+    write in PREOP, SAFEOP and OP) from an ESI Access element. A
+    restriction names the states where it is allowed."""
+    if el is None or not (el.text or "").strip():
+        return "r-r-r-"
+    word = el.text.strip().lower()
+    states = ("preop", "safeop", "op")
+
+    def allowed(attr):
+        listed = (el.get(attr) or "").lower().replace(",", " ").split()
+        return [(not listed) or s in listed for s in states]
+    read, write = allowed("ReadRestrictions"), allowed("WriteRestrictions")
+    out = ""
+    for i in range(3):
+        out += "r" if "r" in word and read[i] else "-"
+        out += "w" if (word in ("rw", "wo")) and write[i] else "-"
+    if word == "wo":
+        out = out.replace("r", "-")
+    return out
+
+
+def _value(text):
+    try:
+        return number(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _default(info, data_type):
+    """DefaultValue, else DefaultData (little endian bytes) as a number."""
+    if info is None:
+        return None, None, None
+    d = _value(_text(info, "DefaultValue"))
+    if d is None and data_type in _TOOL_TYPES.values() and data_type not in ("float", "double"):
+        raw = _text(info, "DefaultData")
+        try:
+            if raw:
+                d = int.from_bytes(bytes.fromhex(raw), "little", signed=data_type in _SIGNED)
+        except ValueError:
+            d = None
+    return _value(_text(info, "MinValue")), _value(_text(info, "MaxValue")), d
+
+
+_dictionaries = {}
+
+
+def dictionary(dev):
+    """The object dictionary an ESI file gives a device, as a coe.Dictionary
+    (with minimum, maximum and default values where the file has them). Empty
+    if the file has none or cannot be read."""
+    key = (dev.path, dev.product_code, dev.revision)
+    if key not in _dictionaries:     # parsing a Beckhoff file takes about a second
+        _dictionaries[key] = _read_dictionary(dev)
+    return _dictionaries[key]
+
+
+def _read_dictionary(dev):
+    out = coe.Dictionary()
+    out.source = "ESI"
+    try:
+        root = ET.parse(dev.path).getroot()
+    except (ET.ParseError, OSError):
+        return out
+    for el in root.findall("Descriptions/Devices/Device"):
+        t = el.find("Type")
+        if t is not None and number(t.get("ProductCode")) == dev.product_code and \
+                number(t.get("RevisionNo") or "0") == dev.revision:
+            break
+    else:
+        return out
+    d = el.find("Profile/Dictionary")
+    if d is None:
+        return out
+    types = {_text(x, "Name"): x for x in d.findall("DataTypes/DataType")}
+    for o in d.findall("Objects/Object"):
+        try:
+            _object(out, o, types)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _object(out, o, types):
+    index = number(_text(o, "Index"))
+    out.objects[index] = _text(o, "Name")
+    dt = types.get(_text(o, "Type"))
+    infos = o.findall("Info/SubItem")
+    object_access = o.find("Flags/Access")
+    subs = dt.findall("SubItem") if dt is not None else []
+    if dt is not None and dt.find("ArrayInfo") is not None and not subs:
+        # an array: sub 0 is the count, then the elements
+        base = _tool_type(_text(dt, "BaseType"))
+        n = number(_text(dt, "ArrayInfo/Elements") or "0")
+        size = number(_text(dt, "BitSize") or "0") // max(n, 1)
+        out.entries[(index, 0)] = coe.CoeEntry(index, 0, "r-r-r-", "uint8", 8, "SubIndex 000")
+        for i in range(1, n + 1):
+            out.entries[(index, i)] = coe.CoeEntry(
+                index, i, _access(object_access), base, size, "%s %d" % (_text(o, "Name"), i))
+        return
+    if not subs:
+        t = _tool_type(_text(o, "Type"))
+        lo, hi, default = _default(o.find("Info"), t)
+        out.entries[(index, 0)] = coe.CoeEntry(
+            index, 0, _access(object_access), t, number(_text(o, "BitSize") or "0"),
+            _text(o, "Name"), lo, hi, default)
+        return
+    by_name = {}
+    for x in infos:
+        by_name.setdefault(_text(x, "Name"), x)
+    for i, sub in enumerate(subs):
+        name = _text(sub, "Name")
+        t = _tool_type(_text(sub, "Type"))
+        info = infos[i] if len(infos) == len(subs) else by_name.get(name)
+        lo, hi, default = _default(info.find("Info") if info is not None else None, t)
+        access = _access(sub.find("Flags/Access"))
+        out.entries[(index, number(_text(sub, "SubIdx") or "0"))] = coe.CoeEntry(
+            index, number(_text(sub, "SubIdx") or "0"), access, t,
+            number(_text(sub, "BitSize") or "0"), name, lo, hi, default)

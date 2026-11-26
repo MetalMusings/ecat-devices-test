@@ -1,0 +1,187 @@
+"""Read from the bus with the userspace master's ethercat tool.
+
+Everything here only reads: slave list, SII, the CoE dictionary and single
+SDO uploads. The tool talks to a running master over its IPC socket, which
+can be a free-running ec_master ("ethercat-uspace start") or the master
+inside a running LinuxCNC.
+"""
+
+import os
+import re
+import subprocess
+import time
+
+TOOL = os.environ.get("ECAT_TOOL", "ethercat-uspace")
+
+
+class ToolError(Exception):
+    pass
+
+
+def run(*args, binary=False):
+    # The tool offers to start a master on a terminal; ecatsetup asks for itself.
+    env = dict(os.environ, ETHERCAT_USPACE_NO_PROMPT="1")
+    proc = subprocess.run([TOOL] + [str(a) for a in args], capture_output=True, env=env)
+    if proc.returncode != 0:
+        raise ToolError("%s %s: %s" % (TOOL, " ".join(map(str, args)),
+                                       proc.stderr.decode(errors="replace").strip()))
+    return proc.stdout if binary else proc.stdout.decode(errors="replace")
+
+
+def slave_positions():
+    """Positions of the slaves on the bus."""
+    return [int(line.split()[0]) for line in run("slaves").splitlines() if line.strip()]
+
+
+def slave_list():
+    """Position -> (name, master's error flag), from the slave list."""
+    slaves = {}
+    for line in run("slaves").splitlines():
+        f = line.split(None, 4)
+        if len(f) >= 4:
+            slaves[int(f[0])] = (f[4] if len(f) > 4 else "", f[3] == "E")
+    return slaves
+
+
+def master_mac():
+    """The MAC address of the master's main Ethernet device, or None."""
+    m = re.search(r"^\s*Main:\s+([0-9a-f]{2}(?::[0-9a-f]{2}){5})", run("master"), re.M | re.I)
+    return m.group(1).lower() if m else None
+
+
+def frame_stats():
+    """The master's frame counts as `ethercat master` shows them (all devices):
+    {"tx": frames sent, "rx": received, "lost": lost, "loss_rate": lost per
+    second over the last second}, or None when it cannot be read."""
+    try:
+        text = run("master")
+    except ToolError:
+        return None
+    common = text.split("Common:", 1)[-1]
+    out = {}
+    for key, rx in (("tx", r"Tx frames:\s+(\d+)"), ("rx", r"Rx frames:\s+(\d+)"),
+                    ("lost", r"Lost frames:\s+(\d+)"), ("loss_rate", r"Loss rate \[1/s\]:\s+(\d+)")):
+        m = re.search(rx, common)
+        if m:
+            out[key] = int(m.group(1))
+    return out if "tx" in out else None
+
+
+def dc_clock(text):
+    """What a slave's EtherCAT chip can do for distributed clocks, from
+    "slaves -v": "64" or "32" (a system time: it can be synchronised),
+    "delay" (it only stamps passing frames, for measuring the delays: no
+    SYNC0), "none", or None if the text does not say."""
+    m = re.search(r"^\s*Distributed clocks:\s*(.*)$", text, re.M)
+    if not m:
+        return None
+    v = m.group(1).strip().lower()
+    if v.startswith("no"):
+        return "none"
+    if "delay" in v:
+        return "delay"
+    m = re.search(r"(32|64) bit", v)
+    return m.group(1) if m else None
+
+
+def slave_info(pos):
+    """Identity and state from "slaves -v" for one slave."""
+    text = run("slaves", "-v", "-p", pos)
+    clock = dc_clock(text)
+    m = re.search(r"^\s*Supported protocols:\s*(.*)$", text, re.M)
+    # dc: the chip has a system time (it can take DC sync); coe: it has CoE
+    info = {"position": pos, "dc": clock in ("32", "64"), "dc_clock": clock,
+            "coe": bool(m and re.search(r"\bCoE\b", m.group(1)))}
+    for key, pattern in (("vendor_id", r"Vendor Id:\s+(0x[0-9a-f]+)"),
+                         ("product_code", r"Product code:\s+(0x[0-9a-f]+)"),
+                         ("revision", r"Revision number:\s+(0x[0-9a-f]+)"),
+                         ("serial", r"Serial number:\s+(0x[0-9a-f]+)")):
+        m = re.search(pattern, text)
+        info[key] = int(m.group(1), 16) if m else None
+    m = re.search(r"^State:\s+(\S+)", text, re.M)
+    info["state"] = m.group(1) if m else "?"
+    # kept by the master since the slave's own code is cleared when the
+    # error is acknowledged (MetalMusings/ethercat)
+    m = re.search(r"^Last AL status code:\s+(0x[0-9a-f]+)", text, re.M)
+    info["al_status_code"] = int(m.group(1), 16) if m else None
+    return info
+
+
+def sii(pos):
+    return run("sii_read", "-p", pos, binary=True)
+
+
+def sdos(pos):
+    return run("sdos", "-p", pos)
+
+
+def pdos(pos):
+    """The slave's PDO assignment and mapping as the master read it at its scan (the
+    slave's own, as it is now: what is in its RAM): [(sm, direction, pdo index, name,
+    [(index, subindex, bits, name)])], from `ethercat pdos`. No SDO traffic."""
+    return parse_pdos(run("pdos", "-p", pos))
+
+
+def parse_pdos(text):
+    """`ethercat pdos -p N` as [(sm, "rx"/"tx", pdo index, name, [(index, sub, bits, name)])]."""
+    import re
+    out, sm = [], None
+    for line in (text or "").splitlines():
+        m = re.match(r"SM(\d+):", line)
+        if m:
+            sm = int(m.group(1))
+            continue
+        m = re.match(r"\s+(Rx|Tx)PDO 0x([0-9a-fA-F]+)\s*\"(.*)\"", line)
+        if m and sm is not None:
+            out.append((sm, m.group(1).lower(), int(m.group(2), 16), m.group(3), []))
+            continue
+        m = re.match(r"\s+PDO entry 0x([0-9a-fA-F]+):([0-9a-fA-F]+),\s*(\d+) bit,\s*\"(.*)\"", line)
+        if m and out:
+            out[-1][4].append((int(m.group(1), 16), int(m.group(2), 16), int(m.group(3)), m.group(4)))
+    return out
+
+
+def sdos_settled(pos, timeout=20.0, interval=0.3, progress=None):
+    """The CoE dictionary of a slave that has one, once the master has read
+    all of it. After a start the master reads the dictionaries in the
+    background for several seconds; until then "sdos" lists nothing or
+    only part. Returns the last listing if it does not settle in time."""
+    end = time.monotonic() + timeout
+    text, told = sdos(pos), False
+    while time.monotonic() < end:
+        time.sleep(interval)
+        again = sdos(pos)
+        if again and again == text:
+            return again
+        if progress and not told:
+            progress("Slave %d: waiting for the master to read its object dictionary" % pos)
+            told = True
+        text = again
+    return text
+
+
+def upload(pos, index, subindex, dtype):
+    """One SDO value as an int (or string), or None if the slave refuses."""
+    try:
+        out = run("upload", "-p", pos, "-t", dtype, "0x%04x" % index, subindex).strip()
+    except ToolError:
+        return None
+    if dtype == "string":
+        return out
+    # "0xffffffff -1": hex, then the value as the type reads it (signed)
+    return int(out.split()[-1], 0)
+
+
+def upload_text(pos, index, subindex, dtype=None):
+    """One SDO value as the tool shows it (such as "0x0010 16"). Raises ToolError."""
+    args = ["upload", "-p", pos] + (["-t", dtype] if dtype else []) + ["0x%04x" % index, subindex]
+    return run(*args).strip()
+
+
+def download(pos, index, subindex, value, dtype=None):
+    """Write one SDO. The type comes from the slave's dictionary unless given.
+    Raises ToolError if the slave refuses."""
+    # "--": a negative value is not an option
+    args = ["download", "-p", pos] + (["-t", dtype] if dtype else []) + \
+        ["--", "0x%04x" % index, subindex, value]
+    run(*args)

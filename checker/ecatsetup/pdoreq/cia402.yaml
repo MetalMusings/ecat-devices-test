@@ -1,0 +1,36 @@
+# What a CiA 402 drive needs in its process data (docs/development.md "Own PDO
+# mapping"). Objects are index numbers; a second axis is shifted by +0x800
+# (ETG.6010). `bit` is the mode's bit in 0x6502 "Supported drive modes".
+profile: cia402
+title: CiA 402 drive
+axis-offset: 0x800
+common:                      # every mode
+  rx: [0x6040]
+  tx: [0x6041]
+modes:
+  csp: {title: Cyclic synchronous position, bit: 7, rx: [0x607A], tx: [0x6064]}
+  csv: {title: Cyclic synchronous velocity, bit: 8, rx: [0x60FF], tx: [0x606C]}
+  pv:  {title: Profile velocity,            bit: 2, rx: [0x60FF], tx: [0x606C]}
+  pp:  {title: Profile position,            bit: 0, rx: [0x607A], tx: [0x6064]}
+  hm:  {title: Homing,                      bit: 5, rx: [], tx: [], only-in-modes: true}
+# With more than one mode the profile writes and checks the mode itself
+# every cycle: 0x6060 out and 0x6061 in must be in the process data.
+several:
+  rx: [0x6060]
+  tx: [0x6061]
+# Never blocking, shown as what a way brings extra or lacks.
+good:
+  rx: []
+  tx: [0x603F, 0x6061]
+# The objects as a PDO entry (for building a mapping where the device's own
+# dictionary is not read): name, bit length, ESI data type.
+objects:
+  0x6040: {dir: rx, name: Controlword, bits: 16, type: UINT}
+  0x6041: {dir: tx, name: Statusword, bits: 16, type: UINT}
+  0x6060: {dir: rx, name: Modes of operation, bits: 8, type: SINT}
+  0x6061: {dir: tx, name: Modes of operation display, bits: 8, type: SINT}
+  0x607A: {dir: rx, name: Target position, bits: 32, type: DINT}
+  0x6064: {dir: tx, name: Position actual value, bits: 32, type: DINT}
+  0x60FF: {dir: rx, name: Target velocity, bits: 32, type: DINT}
+  0x606C: {dir: tx, name: Velocity actual value, bits: 32, type: DINT}
+  0x603F: {dir: tx, name: Error code, bits: 16, type: UINT}

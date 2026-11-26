@@ -1,0 +1,1782 @@
+"""Writing an ecat configuration into a LinuxCNC configuration: the HAL
+files, the INI changes, and the joints connected to drives.
+
+Two HAL files are written next to the INI file:
+
+- ethercat-load.hal, the first HALFILE, loads the component, so that the
+  slaves' pins exist for the user's own HAL files;
+- ethercat.hal, the last HALFILE, adds the component's functions to the
+  servo thread (which exists only once motmod is loaded, in the user's
+  files) and connects the joints to their drives.
+
+The user's own HAL files are changed only where they would clash: lines
+that load lcec or ecat, add their functions, connect a pin that
+ethercat.hal now connects, or set a connected drive's pos-scale are
+commented out with COMMENT in front. The signal names of those lines are
+kept in ethercat.hal, so that other lines using them still work. Every
+changed file is kept as .bak.
+
+Nothing here uses Qt; plan() shows what apply() would write.
+"""
+
+import functools
+import os
+import re
+import shutil
+from dataclasses import dataclass, field
+
+from . import config, lcnc_env
+
+LOAD_FILE = "ethercat-load.hal"
+MAIN_FILE = "ethercat.hal"
+COMMENT = "#ecatsetup: "
+HEADER = ("# Written by EtherCAT Setup; it is rewritten when the program writes the\n"
+          "# configuration again. Change the joints and drives in the program.\n")
+ARROWS = {"=>", "<=", "<=>"}
+
+# a joint's pin, the drive's pin, and which way the value goes
+CONNECTIONS = [
+    ("motor-pos-cmd", "pos-cmd", "=>", "pos-cmd"),
+    ("motor-pos-fb", "pos-fb", "<=", "pos-fb"),
+    ("amp-enable-out", "enable", "=>", "enable"),
+    ("amp-fault-in", "drv-fault", "<=", "amp-fault"),
+]
+HOMING = ("index-enable", "index-enable", "<=>", "index-enable")
+
+# Homing through the homing module cia402_homecomp (a test, beside
+# index-enable; linuxcnc.joints[].homing: homecomp): the module sits
+# between the joint and the drive. As (joint pin, other pin, arrow,
+# suffix) like CONNECTIONS, "J." a pin of the joint, "D." one of the
+# drive. A row whose first pin is already on a signal of this joint
+# adds the other pin to that signal (the module reads the command too).
+HOMECOMP = "cia402_homecomp"
+HOMECOMP_CONNECTIONS = [
+    ("J.motor-pos-cmd", "D.pos-cmd", "=>", "pos-cmd"),
+    ("J.motor-pos-cmd", "J.cia-pos-cmd", "=>", "pos-cmd"),
+    ("J.motor-pos-fb", "J.cia-pos-fb-out", "<=", "pos-fb"),
+    ("J.cia-pos-fb-in", "D.pos-fb", "<=", "pos-actual"),
+    ("J.cia-velocity-fb-in", "D.velocity-fb", "<=", "vel-actual"),
+    ("J.amp-enable-out", "J.cia-enable-in", "=>", "enable"),
+    ("J.cia-enable-out", "D.enable", "=>", "drive-enable"),
+    ("J.amp-fault-in", "D.drv-fault", "<=", "amp-fault"),
+    ("J.cia-stat-fault", "D.drv-fault", "<=", "amp-fault"),
+    ("J.cia-home", "D.home", "=>", "home"),
+    ("J.cia-stat-homed", "D.stat-homed", "<=", "homed"),
+    ("J.cia-stat-homing", "D.stat-homing", "<=", "homing"),
+    ("J.cia-stat-homing-error", "D.home-error", "<=", "home-error"),
+    ("J.cia-stat-op-enabled", "D.stat-op-enabled", "<=", "op-enabled"),
+    ("J.cia-opmode-display", "D.opmode-display", "<=", "opmode"),
+]
+
+
+# -- the INI file
+
+EXPANDED = ".expanded"
+
+
+def include_path(ini_path, name):
+    """The file an #INCLUDE line names, as the linuxcnc script finds it:
+    ~ and $VARIABLES expanded, relative to the INI file's folder."""
+    name = os.path.expandvars(os.path.expanduser(name))
+    return os.path.join(os.path.dirname(os.path.abspath(ini_path)), name)
+
+
+def ini_lines(path):
+    """[(file, line)] of an INI file with its #INCLUDEs in place, as the
+    linuxcnc script expands them before anything reads the file: only the
+    main file's "#INCLUDE <file>" lines count (an included file is copied
+    as it is), and a file that cannot be read is left out. The #INCLUDE
+    line itself stays, as a comment of the main file."""
+    out = []
+    for line in read_text(path).splitlines(keepends=True):
+        out.append((path, line))
+        f = line.split()
+        if len(f) >= 2 and f[0] == "#INCLUDE":
+            inc = include_path(path, line.strip()[len("#INCLUDE"):].strip())
+            try:
+                text = read_text(inc)
+            except OSError:
+                continue
+            if text and not text.endswith("\n"):
+                text += "\n"
+            out += [(inc, x) for x in text.splitlines(keepends=True)]
+    return out
+
+
+def ini_includes(path):
+    """The files the INI file's #INCLUDE lines name that exist."""
+    return list(dict.fromkeys(f for f, _ in ini_lines(path) if f != path))
+
+
+def expanded_source(path):
+    """For the file LinuxCNC writes from an INI file with #INCLUDEs
+    (<name>.ini.expanded, written again at every start), the INI file it is
+    made from; None for any other file."""
+    if path.endswith(EXPANDED):
+        src = path[:-len(EXPANDED)]
+        return src if os.path.exists(src) else None
+    return None
+
+
+def _sections(lines):
+    """Each line's section, and whether it is in the first section of that
+    name: LinuxCNC's INI reader looks a key up in the first [SECTION] only."""
+    out, current, first, seen = [], None, False, set()
+    for line in lines:
+        t = line.strip()
+        if t.startswith("[") and "]" in t:
+            current = t[1:t.index("]")].strip()
+            first = current not in seen
+            seen.add(current)
+        out.append((current, first))
+    return out
+
+
+def read_ini(path):
+    """[(section, key, value)] in file order, as LinuxCNC reads them:
+    #INCLUDEs expanded, and only the first section of each name."""
+    out = []
+    lines = [x for _, x in ini_lines(path)]
+    for line, (section, first) in zip(lines, _sections(lines)):
+        s = line.strip()
+        if section and first and "=" in s and not s.startswith(("#", ";", "[")):
+            k, v = s.split("=", 1)
+            out.append((section, k.strip(), v.split("#")[0].strip()))
+    return out
+
+
+def ini_config(ini):
+    """The configuration file the INI file names ([ETHERCAT]CONFIG, beside
+    the INI file), or None when it names none or the INI cannot be read."""
+    try:
+        name = ini_get(read_ini(ini), "ETHERCAT", "CONFIG")
+    except OSError:
+        return None
+    return os.path.join(os.path.dirname(os.path.abspath(ini)), name) if name else None
+
+
+def ini_get(entries, section, key, default=None):
+    for s, k, v in entries:
+        if s == section and k == key:
+            return v
+    return default
+
+
+def ini_all(entries, section, key):
+    return [v for s, k, v in entries if s == section and k == key]
+
+
+def ini_joints(ini_path):
+    """[(joint number, axis letter or "", joint type)] from the INI file."""
+    e = read_ini(ini_path)
+    try:
+        n = int(ini_get(e, "KINS", "JOINTS") or 0)
+    except ValueError:
+        n = 0
+    letters = ""
+    kins = ini_get(e, "KINS", "KINEMATICS") or ""
+    m = re.search(r"coordinates=([A-Za-z]+)", kins)
+    if m:
+        letters = m.group(1).upper()
+    else:
+        letters = (ini_get(e, "KINS", "COORDINATES") or ini_get(e, "TRAJ", "COORDINATES")
+                   or "").replace(" ", "").upper()
+    return [(j, letters[j] if len(letters) == n else "",
+             ini_get(e, "JOINT_%d" % j, "TYPE", "LINEAR")) for j in range(n)]
+
+
+HALLIB = os.environ.get("HALLIB_DIR") or lcnc_env.hallib()
+
+
+def find_hal_file(d, name):
+    """Where LinuxCNC finds a HALFILE: the configuration folder, then its
+    library (HALLIB_PATH is .:HALLIB_DIR); LIB: names only the library."""
+    if name.startswith("LIB:"):
+        return os.path.join(HALLIB, name[4:])
+    path = os.path.join(d, name)
+    if os.path.exists(path):
+        return path
+    lib = os.path.join(HALLIB, name)
+    return lib if os.path.exists(lib) else path
+
+
+def user_hal_files(ini_path, postgui=None):
+    """The INI's HAL files other than ecat's own, as paths. postgui True
+    gives only the POSTGUI_HALFILEs, False only the HALFILEs."""
+    d = os.path.dirname(os.path.abspath(ini_path))
+    e = read_ini(ini_path)
+    files = []
+    for key in ("HALFILE", "POSTGUI_HALFILE"):
+        if postgui is not None and postgui != (key == "POSTGUI_HALFILE"):
+            continue
+        for v in ini_all(e, "HAL", key):
+            name = v.split()[0] if v.split() else ""
+            if name in (LOAD_FILE, MAIN_FILE) or not name:
+                continue
+            files.append(find_hal_file(d, name))
+    return files
+
+
+def hal_entries(ini_path):
+    """[(INI value, path, postgui)] of the INI's HAL files other than ecat's."""
+    d = os.path.dirname(os.path.abspath(ini_path))
+    out = []
+    for key in ("HALFILE", "POSTGUI_HALFILE"):
+        for v in ini_all(read_ini(ini_path), "HAL", key):
+            name = v.split()[0] if v.split() else ""
+            if name in (LOAD_FILE, MAIN_FILE) or not name:
+                continue
+            out.append((v, find_hal_file(d, name), key == "POSTGUI_HALFILE"))
+    return out
+
+
+# LinuxCNC's simulated configurations (configs/sim): files that simulate
+SIM_FILES = {
+    "simulated_home.hal": "home switches", "simulated_home_lathe.hal": "home switches",
+    "simulated-gantry-home.hal": "home switches", "simulated-xyyz-home.hal": "home switches",
+    "simulated_limits.hal": "limit switches", "sim_spindle_encoder.hal": "the spindle",
+    "spindle_sim.hal": "the spindle", "gantrysim.hal": "a gantry's joints",
+}
+_SWITCH = re.compile(r"joint\.\d+\.(home-sw-in|pos-lim-sw-in|neg-lim-sw-in)$")
+BASIC_SIM = "basic_sim.tcl"
+
+# outputs of components, by HAL's naming: a pin that writes its signal
+_WRITER = re.compile(r"\.(out|out-not|out-invert|home-sw|position-fb|velocity-fb)$")
+
+
+def basic_sim_file(ini_path):
+    """The HAL file LIB:basic_sim.tcl saved when the configuration last ran
+    (<ini name>_cmds.hal in its folder), or None."""
+    d = os.path.dirname(os.path.abspath(ini_path))
+    path = os.path.join(d, os.path.splitext(os.path.basename(ini_path))[0] + "_cmds.hal")
+    return path if os.path.exists(path) else None
+
+
+def ini_texts(ini_path, yaml_name, replace=None, homemod=None):
+    """{file: new text} of the INI file and the files it includes, with
+    [ETHERCAT]CONFIG and the two HALFILEs; replace: {HALFILE value: new
+    value} (a file copied into the folder). The HALFILEs go into the first
+    [HAL] section, in the file that holds it (an #INCLUDEd one too), since
+    LinuxCNC reads only that one; a new [ETHERCAT] goes just before it.
+    homemod: [EMCMOT]HOMEMOD is set to it; without it a HOMEMOD of
+    cia402_homecomp (which only ecatsetup puts there) is taken out."""
+    nl = "\n"
+    tagged = [list(x) for x in ini_lines(ini_path)]   # [file, line]
+    for x in tagged:
+        t = x[1].strip()
+        if replace and "=" in t and t.split("=", 1)[0].strip() in ("HALFILE", "POSTGUI_HALFILE"):
+            v = t.split("=", 1)[1].split("#")[0].strip()
+            if v in replace:
+                x[1] = "%s = %s%s" % (t.split("=", 1)[0].strip(), replace[v], nl)
+
+    def key_of(line):
+        t = line.strip()
+        if "=" not in t or t.startswith(("#", ";", "[")):
+            return None
+        return t.split("=", 1)[0].strip()
+
+    def in_first(name):
+        secs = _sections([x[1] for x in tagged])
+        return [i for i, (s, first) in enumerate(secs) if s == name and first]
+
+    # [HAL]: ours out (from every [HAL]), then in again where they belong
+    secs = _sections([x[1] for x in tagged])
+    tagged = [x for x, (s, _) in zip(tagged, secs)
+              if not (s == "HAL" and key_of(x[1]) == "HALFILE"
+                      and x[1].split("=", 1)[1].split("#")[0].strip() in (LOAD_FILE, MAIN_FILE))]
+    hal = in_first("HAL")
+    if not hal:
+        mine = [x for x in tagged if x[0] == ini_path]
+        if mine and not mine[-1][1].endswith("\n"):
+            mine[-1][1] += nl
+        tagged += [[ini_path, nl], [ini_path, "[HAL]" + nl]]
+        hal = [len(tagged) - 1]
+    hal_file = tagged[hal[0]][0]
+    halfiles = [i for i in hal if key_of(tagged[i][1]) == "HALFILE"]
+    first = halfiles[0] if halfiles else hal[0] + 1
+    last = (halfiles[-1] + 1) if halfiles else hal[0] + 1
+    tagged.insert(last, [hal_file, "HALFILE = %s%s" % (MAIN_FILE, nl)])
+    tagged.insert(first, [hal_file, "HALFILE = %s%s" % (LOAD_FILE, nl)])
+
+    # [EMCMOT]HOMEMOD: the homing module, cia402_homecomp's only
+    secs = _sections([x[1] for x in tagged])
+    tagged = [x for x, (sec, _) in zip(tagged, secs)
+              if not (sec == "EMCMOT" and key_of(x[1]) == "HOMEMOD" and not homemod
+                      and x[1].split("=", 1)[1].split("#")[0].strip() == HOMECOMP)]
+    if homemod:
+        emc = in_first("EMCMOT")
+        line = "HOMEMOD = %s%s" % (homemod, nl)
+        keys = [i for i in emc if key_of(tagged[i][1]) == "HOMEMOD"]
+        if keys:
+            tagged[keys[0]][1] = line
+        elif emc:
+            tagged.insert(emc[0] + 1, [tagged[emc[0]][0], line])
+        else:
+            at = in_first("HAL")[0]
+            tagged[at:at] = [[hal_file, "[EMCMOT]" + nl], [hal_file, line], [hal_file, nl]]
+
+    # [ETHERCAT]CONFIG, in the first [ETHERCAT], or a new one before [HAL]
+    eth = in_first("ETHERCAT")
+    cfg_line = "CONFIG = %s%s" % (yaml_name, nl)
+    keys = [i for i in eth if key_of(tagged[i][1]) == "CONFIG"]
+    if keys:
+        tagged[keys[0]][1] = cfg_line
+    elif eth:
+        tagged.insert(eth[0] + 1, [tagged[eth[0]][0], cfg_line])
+    else:
+        at = in_first("HAL")[0]
+        tagged[at:at] = [[hal_file, "[ETHERCAT]" + nl], [hal_file, cfg_line], [hal_file, nl]]
+
+    out = {}
+    for f, line in tagged:
+        out[f] = out.get(f, "") + line
+    return out
+
+
+def ini_text(ini_path, yaml_name, replace=None, homemod=None):
+    """The main INI file's new text (see ini_texts)."""
+    return ini_texts(ini_path, yaml_name, replace, homemod).get(ini_path, "")
+
+
+# -- the user's HAL files
+
+def read_text(path):
+    with open(path, errors="replace") as f:
+        return f.read()
+
+
+def is_tcl(path):
+    return path.endswith(".tcl")
+
+
+def read_hal(path, ini_path=None):
+    """A HAL file's text; a .tcl one as the plain HAL it gives with the INI
+    file's values (haltcl.py). Raises OSError."""
+    if is_tcl(path):
+        from . import haltcl
+        return haltcl.expand(path, ini_path).text
+    return read_text(path)
+
+
+# panels that only simulate the machine's inputs (QtPlasmaC's): Apply takes them out
+SIM_PANELS = ("qtplasmac_sim",)
+
+
+def _panel_pin(x):
+    return x.split(".", 1)[0] in SIM_PANELS
+
+
+ADDED = "  " + COMMENT + "added"    # the end of a line an earlier plan put in
+
+
+def original(text):
+    """A HAL file's text as the user wrote it: lines commented out by an
+    earlier plan are back, and lines it added are gone, so that every plan
+    starts from the same text. A plan puts its lines right after the
+    commented-out lines they replace; an added line that no longer follows
+    one (the user removed the commented lines) is the user's now and stays,
+    or the next plan would drop it without putting anything back."""
+    out = []
+    follows_comment = False
+    for line in text.splitlines(keepends=True):
+        if line.rstrip("\n").endswith(ADDED):
+            if follows_comment:
+                continue
+            out.append(line)
+            continue
+        follows_comment = line.startswith(COMMENT)
+        out.append(line[len(COMMENT):] if follows_comment else line)
+    return "".join(out)
+
+def statements(text):
+    """(first line index, last line index, tokens) of each HAL statement,
+    with comments left out and backslash continuations joined."""
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        start, parts = i, []
+        while True:
+            body = lines[i].split("#", 1)[0].rstrip()
+            if body.endswith("\\"):
+                parts.append(body[:-1])
+                if i + 1 < len(lines):
+                    i += 1
+                    continue
+            else:
+                parts.append(body)
+            break
+        tokens = " ".join(parts).split()
+        if tokens:
+            yield start, i, tokens
+        i += 1
+
+
+def net_pins(tokens):
+    """A net statement's signal and pins."""
+    rest = [t for t in tokens[2:] if t not in ARROWS]
+    return tokens[1], rest
+
+
+def signals(paths, ini_path=None):
+    """signal -> set of pins, over HAL files (.tcl ones with ini_path's
+    values)."""
+    sig = {}
+    for path in paths:
+        try:
+            text = original(read_hal(path, ini_path))
+        except OSError:
+            continue
+        for _, _, t in statements(text):
+            if t[0] == "net" and len(t) > 1:
+                name, pins = net_pins(t)
+                sig.setdefault(name, set()).update(pins)
+    return sig
+
+
+def setp_values(paths, ini_path=None):
+    """pin or parameter -> the value it is set to, over HAL files."""
+    out = {}
+    for path in paths:
+        try:
+            text = original(read_hal(path, ini_path))
+        except OSError:
+            continue
+        for _, _, t in statements(text):
+            if t[0] == "setp" and len(t) == 3:
+                out[t[1]] = t[2]
+            elif len(t) == 3 and t[1] == "=" and "." in t[0]:
+                out[t[0]] = t[2]
+    return out
+
+
+def resolve(value, ini_entries):
+    """A HAL value, with [SECTION]KEY taken from the INI file."""
+    m = re.fullmatch(r"\[([^\]]+)\](\S+)", value or "")
+    if m:
+        return ini_get(ini_entries, m.group(1), m.group(2))
+    return value
+
+
+def drives(cfg):
+    """{name: slave} of the drives a joint can be connected to: the pin
+    prefix of each CSP axis (the slave's name, or its cia402.axes)."""
+    out = {}
+    for s in (cfg or {}).get("slaves") or []:
+        if s.get("profile") == "cia402" and (s.get("cia402") or {}).get("mode") == "csp":
+            for a in config.axes(s):
+                out[a] = s
+    return out
+
+
+def scale_from(counts_per_rev, units_per_rev, gear=1.0):
+    """A joint's pos-scale (counts per machine unit) from the drive's counts
+    per motor revolution, the machine units per revolution of the screw or
+    pulley (its lead), and the gear between motor and screw (motor turns
+    per screw turn)."""
+    if not counts_per_rev or not units_per_rev or not gear:
+        raise ValueError("counts per revolution, units per revolution and the gear must not be 0")
+    return float(counts_per_rev) * float(gear) / float(units_per_rev)
+
+
+def joint_checks(ini_path, cfg, max_counts=None):
+    """Notes on the INI file's joints against their drives: limits that
+    are missing or more than a drive can do. max_counts: {drive: its
+    maximum velocity in counts per second (0x607F)}, where read."""
+    out = []
+    e = read_ini(ini_path)
+    if ini_get(e, "EMCMOT", "SERVO_PERIOD") is None:
+        out.append("[EMCMOT]SERVO_PERIOD is not set: the servo thread runs at LinuxCNC's "
+                   "default, 1 ms, which is also the EtherCAT cycle")
+    for j in joints(cfg):
+        sec = "JOINT_%d" % j["joint"]
+        for key in ("FERROR", "MIN_FERROR"):
+            if ini_get(e, sec, key) is None:
+                out.append("[%s]%s is not set: LinuxCNC's default is used; set it for the "
+                           "machine (in machine units)" % (sec, key))
+        if homes_by_drive(cfg, j.get("slave")) and j.get("homing") == "homecomp":
+            use = str(resolve(ini_get(e, sec, "HOME_USE_INDEX", "NO"), e) or "NO").strip().upper()
+            if use in ("YES", "TRUE", "1"):
+                out.append("[%s]HOME_USE_INDEX is YES: the joint homes through cia402_homecomp, "
+                           "which does not use the index; set it to NO" % sec)
+        elif homes_by_drive(cfg, j.get("slave")):
+            use = str(resolve(ini_get(e, sec, "HOME_USE_INDEX", "NO"), e) or "NO").strip().upper()
+            if use not in ("YES", "TRUE", "1"):
+                out.append("[%s]HOME_USE_INDEX is not YES: %s homes the joint through its "
+                           "index-enable handshake, which motion only uses when the joint homes "
+                           "on an index (HOME_USE_INDEX = YES, HOME_SEARCH_VEL = 0)"
+                           % (sec, j.get("slave")))
+        try:
+            v = float(resolve(ini_get(e, sec, "MAX_VELOCITY"), e))
+        except (TypeError, ValueError):
+            continue
+        limit = (max_counts or {}).get(j.get("slave"))
+        counts = abs(v * float(j.get("scale") or 1.0))
+        if limit and counts > limit:
+            out.append("[%s]MAX_VELOCITY %g units/s is %d counts/s, more than %s's maximum "
+                       "profile velocity (0x607F) of %d counts/s" % (sec, v, counts,
+                                                                     j.get("slave"), limit))
+    return out
+
+
+FERROR_MARGIN = 2.0     # the drive's window is this many times LinuxCNC's FERROR
+
+
+def following_error_suggestion(ini_path, cfg, slave):
+    """A following-error window for a CiA 402 drive's settings, as
+    {"object": "0x6065:00", "type": "UINT", "value": counts, "why": text}, or
+    {"why": text} when none can be worked out.
+
+    The drive is the second line of defence: its window is FERROR_MARGIN times
+    the joint's FERROR (machine units) in the joint's counts, so that LinuxCNC's
+    own following error trips first. The object is the quirk file's
+    `limits: following-error`, else 0x6065 (as the drive test)."""
+    from . import drivetest, propose, quirks
+    names = config.axes(slave)
+    if len(names) != 1:
+        return {"why": "the drive has several axes: set their following-error windows by hand"}
+    joint = next((j for j in joints(cfg) if j.get("slave") == names[0]), None)
+    if joint is None:
+        return {"why": "no joint is connected to %s (Joints card)" % names[0]}
+    if not ini_path:
+        return {"why": "the INI file is not known: choose it first"}
+    e = read_ini(ini_path)
+    sec = "JOINT_%d" % joint["joint"]
+    try:
+        ferror = float(resolve(ini_get(e, sec, "FERROR"), e))
+    except (TypeError, ValueError):
+        return {"why": "[%s]FERROR is not set in the INI file" % sec}
+    where = quirks.limits(slave).get("following-error")
+    if isinstance(where, str):
+        return {"why": "this drive's own object is not used: %s" % where}
+    index, sub, tool_type = where or drivetest.STANDARD_LIMITS["following-error"]
+    scale = abs(float(joint.get("scale") or 1.0))
+    value = int(round(ferror * scale * FERROR_MARGIN))
+    return {"object": "0x%04X:%02X" % (index, sub),
+            "type": propose.COE_TYPES.get(tool_type, tool_type.upper()),
+            "value": max(value, 1),
+            "why": "%g x [%s]FERROR %g x scale %g" % (FERROR_MARGIN, sec, ferror, scale)}
+
+
+def check_at_start(cfg):
+    """linuxcnc.check-hal-at-start: run the HAL check when LinuxCNC starts."""
+    return ((cfg or {}).get("linuxcnc") or {}).get("check-hal-at-start") is True
+
+
+def joints(cfg):
+    """The configuration's joint list: [{"joint", "slave", "scale"}]."""
+    return ((cfg or {}).get("linuxcnc") or {}).get("joints") or []
+
+
+def joint_homing(cfg, joint):
+    """How a joint homes by its drive: "homecomp" (the homing module
+    cia402_homecomp) or "index" (index-enable, the default)."""
+    for j in joints(cfg):
+        if j.get("joint") == joint:
+            return "homecomp" if j.get("homing") == "homecomp" else "index"
+    return "index"
+
+
+def set_joint_homing(cfg, joint, way):
+    """Home a joint through index-enable ("index") or cia402_homecomp ("homecomp")."""
+    for j in joints(cfg):
+        if j.get("joint") == joint:
+            if way == "homecomp":
+                j["homing"] = "homecomp"
+            else:
+                j.pop("homing", None)
+
+
+def uses_homecomp(cfg):
+    """Whether a joint of the configuration homes through cia402_homecomp."""
+    return any(j.get("homing") == "homecomp" for j in joints(cfg))
+
+
+def set_joint(cfg, joint, slave=None, scale=None):
+    """Connect a joint to a drive, or (slave None) to nothing. The joint's
+    homing choice stays while it keeps its drive."""
+    lc = cfg.setdefault("linuxcnc", {})
+    old = {j.get("joint"): j for j in lc.get("joints") or []}.get(joint) or {}
+    js = [j for j in lc.get("joints") or [] if j.get("joint") != joint]
+    if slave:
+        js.append({"joint": joint, "slave": slave, "scale": float(scale or 1.0)})
+        if old.get("slave") == slave and old.get("homing"):
+            js[-1]["homing"] = old["homing"]
+    js.sort(key=lambda j: j["joint"])
+    if js:
+        lc["joints"] = js
+    else:
+        lc.pop("joints", None)
+        if not lc:
+            cfg.pop("linuxcnc", None)
+
+
+def rename_slave(cfg, old, new):
+    """A slave renamed from old to new: its joints and nets follow, and so
+    do its axes named after it (old-1, old-2 become new-1, new-2)."""
+    renamed = {old: new}
+    for s in (cfg or {}).get("slaves") or []:
+        ax = (s.get("cia402") or {}).get("axes") if s.get("name") == new else None
+        if isinstance(ax, list):
+            for i, a in enumerate(ax):
+                if isinstance(a, str) and a.startswith(old + "-"):
+                    ax[i] = renamed[a] = new + a[len(old):]
+    for j in joints(cfg):
+        if j.get("slave") in renamed:
+            j["slave"] = renamed[j["slave"]]
+    def follow(p):
+        prefix = next((o for o in renamed if p.startswith(o + ".")), None)
+        return renamed[prefix] + p[len(prefix):] if prefix else p
+    for n in nets(cfg):
+        n["pins"] = [follow(p) for p in n.get("pins") or []]
+    for e in ((cfg or {}).get("linuxcnc") or {}).get("old-pins") or []:
+        if isinstance(e, dict) and isinstance(e.get("new"), str):
+            e["new"] = follow(e["new"])
+    return renamed
+
+
+def rename_in_hal(ini_path, renamed):
+    """What renaming pin prefixes ({old: new}, from rename_slave) changes in
+    the user's HAL files in the configuration folder: a Plan of FileChanges
+    and how many pins each file has. Comments are left alone, and so are
+    ecatsetup's own files (written again) and LinuxCNC's hallib."""
+    p = Plan()
+    d = os.path.dirname(os.path.abspath(ini_path))
+    pats = [(re.compile(r"(?<!\S)" + re.escape(old + ".")), new + ".")
+            for old, new in sorted(renamed.items(), key=lambda kv: -len(kv[0])) if old != new]
+    if not pats:
+        return p
+    for path in user_hal_files(ini_path):
+        if not path.endswith(".hal") or os.path.dirname(os.path.abspath(path)) != d:
+            continue
+        try:
+            text = read_text(path)
+        except OSError:
+            continue
+        count, lines = 0, []
+        for line in text.splitlines(keepends=True):
+            body, hash_, comment = line.partition("#")
+            for pat, new in pats:
+                body, n = pat.subn(new, body)
+                count += n
+            lines.append(body + hash_ + comment)
+        new_text = "".join(lines)
+        if new_text != text:
+            p.changes.append(FileChange(path, "change", text, new_text,
+                                        "%d pin%s renamed" % (count, "" if count == 1 else "s")))
+    return p
+
+
+# -- inputs and outputs: nets between the slaves' pins and LinuxCNC's
+
+# LinuxCNC pins a slave's pin is often connected to: (pattern, HAL type,
+# direction seen from HAL: "in" is read by LinuxCNC, "out" written by it,
+# "io" both: a handshake such as index-enable)
+KNOWN_PINS = [
+    (r"iocontrol\.0\.emc-enable-in", "bool", "in"),
+    (r"iocontrol\.0\.user-enable-out", "bool", "out"),
+    (r"iocontrol\.0\.user-request-enable", "bool", "out"),
+    (r"iocontrol\.0\.(coolant-flood|coolant-mist)", "bool", "out"),
+    (r"motion\.digital-in-\d\d", "bool", "in"),
+    (r"motion\.digital-out-\d\d", "bool", "out"),
+    (r"motion\.analog-in-\d\d", "real", "in"),
+    (r"motion\.analog-out-\d\d", "real", "out"),
+    (r"motion\.probe-input", "bool", "in"),
+    (r"motion\.feed-hold", "bool", "in"),
+    (r"motion\.enable", "bool", "in"),
+    (r"joint\.\d+\.(home-sw-in|pos-lim-sw-in|neg-lim-sw-in|amp-fault-in)", "bool", "in"),
+    (r"joint\.\d+\.amp-enable-out", "bool", "out"),
+    (r"joint\.\d+\.motor-pos-cmd", "real", "out"),
+    (r"joint\.\d+\.motor-pos-fb", "real", "in"),
+    (r"spindle\.\d+\.(on|forward|reverse|brake)", "bool", "out"),
+    (r"spindle\.\d+\.(speed-out|speed-out-abs|speed-out-rps|speed-out-rps-abs)",
+     "real", "out"),
+    (r"spindle\.\d+\.(at-speed|is-oriented)", "bool", "in"),
+    (r"spindle\.\d+\.orient-fault", "sint", "in"),
+    (r"spindle\.\d+\.(speed-in|revs)", "real", "in"),
+    (r"(joint|spindle)\.\d+\.index-enable", "bool", "io"),
+    (r"halui\.(machine|mist|flood)\.(on|off)", "bool", "in"),
+    (r"halui\.estop\.(activate|reset)", "bool", "in"),
+    (r"halui\.program\.(run|pause|resume|step|stop)", "bool", "in"),
+    (r"halui\.(machine|mist|flood)\.is-on", "bool", "out"),
+    (r"halui\.estop\.is-activated", "bool", "out"),
+    (r"halui\.program\.is-(running|paused|idle)", "bool", "out"),
+    # plasmac (QtPlasmaC's component): the torch and its sensors
+    (r"plasmac\.(arc-ok-in|float-switch|ohmic-probe|breakaway|move-up|move-down)", "bool", "in"),
+    (r"plasmac\.arc-voltage-in", "real", "in"),
+    (r"plasmac\.(torch-on|ohmic-enable|scribe-arm|scribe-on)", "bool", "out"),
+]
+
+# suggestions offered in the window, by HAL type and direction there
+SUGGESTIONS = [
+    "iocontrol.0.emc-enable-in", "iocontrol.0.user-enable-out",
+    "iocontrol.0.user-request-enable", "iocontrol.0.coolant-flood",
+    "iocontrol.0.coolant-mist", "motion.probe-input", "motion.feed-hold",
+] + ["motion.digital-in-%02d" % i for i in range(4)] + \
+    ["motion.digital-out-%02d" % i for i in range(4)] + \
+    ["motion.analog-in-%02d" % i for i in range(4)] + \
+    ["motion.analog-out-%02d" % i for i in range(4)] + [
+    "spindle.0.on", "spindle.0.forward", "spindle.0.reverse", "spindle.0.speed-out",
+    "spindle.0.speed-out-abs", "spindle.0.at-speed", "spindle.0.speed-in",
+    "halui.machine.on", "halui.machine.off", "halui.estop.activate", "halui.estop.reset",
+    "halui.program.run", "halui.program.pause", "halui.program.resume",
+    "halui.program.stop", "halui.machine.is-on", "halui.estop.is-activated",
+]
+
+# HAL takes any name without blanks; '#' would start a comment in a HAL file
+SIGNAL_RE = re.compile(r"[^\s#<=>][^\s#]{0,46}")
+PIN_RE = SIGNAL_RE
+
+
+_KNOWN_RE = []
+
+
+@functools.lru_cache(maxsize=8192)
+def known_pin(pin):
+    """(HAL type, direction) of a LinuxCNC pin in KNOWN_PINS, or None."""
+    if not _KNOWN_RE:
+        _KNOWN_RE.extend((re.compile(pattern), t, d) for pattern, t, d in KNOWN_PINS)
+    for pattern, t, d in _KNOWN_RE:
+        if pattern.fullmatch(pin):
+            return t, d
+    return None
+
+
+def suggestions(ini_path=None):
+    """LinuxCNC pins to offer, with the INI file's joints' switches."""
+    out = list(SUGGESTIONS)
+    if ini_path:
+        try:
+            for j, _, _ in ini_joints(ini_path):
+                out += ["joint.%d.%s" % (j, x) for x in ("home-sw-in", "pos-lim-sw-in",
+                                                         "neg-lim-sw-in")]
+        except OSError:
+            pass
+    return out
+
+
+def slave_pins(cfg):
+    """{pin: (HAL type, direction)} of the pins of the slaves that can be connected:
+    the process data pins, and those the component makes beyond them (an encoder
+    channel's pos, index-enable ..., a drive's status pins, the slave's state). Not
+    parameters, the master's pins, or those a joint's connection takes. Direction as
+    seen from HAL: an input of the slave is an "out" pin; "io" is a handshake pin
+    (index-enable) that both sides read and write."""
+    from . import halpins
+    out = {}
+    taken = joint_pins(cfg)
+    for pin, (htype, d) in halpins.pins(cfg).items():
+        if d in ("in", "out", "io") and not pin.startswith("ecat.") and pin not in taken:
+            out[pin] = (htype, d)
+    return out
+
+
+def _bit_entry(cfg, pin):
+    """(entry, bit name or None) of a slave's bool or bit pin "<slave>.<pin>", or None."""
+    for s in (cfg or {}).get("slaves") or []:
+        for kind in ("outputs", "inputs"):
+            for pdo in (s.get("process-data") or {}).get(kind) or []:
+                for e in pdo.get("entries") or []:
+                    if "pin" in e and e.get("hal-type") == "bool" and \
+                            pin == "%s.%s" % (s.get("name"), e["pin"]):
+                        return e, None
+                    for p in e.get("split") or []:
+                        if p and pin == "%s.%s" % (s.get("name"), p):
+                            return e, p
+    return None
+
+
+def pin_inverted(cfg, pin):
+    """True or False for a slave's bit pin (a bool pin, or one bit of a bit field):
+    is it the opposite of the bit? None for any other pin."""
+    found = _bit_entry(cfg, pin)
+    if found is None:
+        return None
+    e, bit = found
+    inv = e.get("invert")
+    if bit is None:
+        return bool(inv)
+    return isinstance(inv, list) and bit in inv
+
+
+def set_pin_inverted(cfg, pin, on):
+    """Make a slave's bit pin the opposite of its bit (or not): `invert` in the entry.
+    Returns False when the pin is not a bit pin."""
+    found = _bit_entry(cfg, pin)
+    if found is None:
+        return False
+    e, bit = found
+    if bit is None:
+        if on:
+            e["invert"] = True
+        else:
+            e.pop("invert", None)
+        return True
+    names = [n for n in e.get("invert") or [] if n != bit] if isinstance(e.get("invert"), list) \
+        else []
+    if on:
+        names = [p for p in e["split"] if p and (p in names or p == bit)]   # in bit order
+    if names:
+        e["invert"] = names
+    else:
+        e.pop("invert", None)
+    return True
+
+
+def own_prefixes(cfg):
+    """The pin prefixes of the configuration's slaves and axes: "<name>."."""
+    out = []
+    for s in (cfg or {}).get("slaves") or []:
+        out += [x + "." for x in [s.get("name")] + config.axes(s) if x]
+    return list(dict.fromkeys(out))
+
+
+def is_own(cfg, pin):
+    return any(pin.startswith(p) for p in own_prefixes(cfg))
+
+
+def nets(cfg):
+    """The configuration's nets: [{"signal", "pins"}]."""
+    return ((cfg or {}).get("linuxcnc") or {}).get("nets") or []
+
+
+def net_of(cfg, pin):
+    return next((n for n in nets(cfg) if pin in (n.get("pins") or [])), None)
+
+
+def default_signal(pin):
+    return pin.replace(".", "-")
+
+
+def set_net(cfg, pin, others, signal=None):
+    """Connect a slave's pin to other pins (others empty: to nothing). Its
+    net keeps its signal name unless one is given."""
+    others = [p for p in dict.fromkeys(others or []) if p and p != pin]
+    lc = cfg.setdefault("linuxcnc", {})
+    ns = [n for n in lc.get("nets") or []]
+    old = next((n for n in ns if pin in (n.get("pins") or [])), None)
+    if old is not None:
+        ns.remove(old)
+    if others:
+        ns.append({"signal": signal or (old or {}).get("signal") or default_signal(pin),
+                   "pins": [pin] + others})
+    ns.sort(key=lambda n: n.get("signal") or "")
+    if ns:
+        lc["nets"] = ns
+    else:
+        lc.pop("nets", None)
+        if not lc:
+            cfg.pop("linuxcnc", None)
+
+
+def params(cfg):
+    """The configuration's parameter values: [{"pin", "value"}]."""
+    return ((cfg or {}).get("linuxcnc") or {}).get("params") or []
+
+
+def set_param(cfg, pin, value):
+    """Give a slave's parameter a value (None: back to the component's default)."""
+    lc = cfg.setdefault("linuxcnc", {})
+    ps = [e for e in lc.get("params") or [] if e.get("pin") != pin]
+    if value is not None:
+        ps.append({"pin": pin, "value": value})
+    ps.sort(key=lambda e: e.get("pin") or "")
+    if ps:
+        lc["params"] = ps
+    else:
+        lc.pop("params", None)
+        if not lc:
+            cfg.pop("linuxcnc", None)
+
+
+def param_text(value):
+    """A parameter value as HAL's setp takes it."""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    return repr(float(value)) if isinstance(value, float) else str(value)
+
+
+def joint_pins(cfg):
+    """{pin: joint} of the pins a joint's connection takes."""
+    out = {}
+    for n, _, _, conns in _managed(cfg):
+        for c in conns:
+            out[c[0]] = out[c[1]] = n
+    return out
+
+
+def propose_nets(ini_path, cfg):
+    """{signal: [pins]} as the user's HAL files (not the POSTGUI ones)
+    connect the slaves' pins, for signals the configuration does not have
+    and that no joint uses."""
+    files = user_hal_files(ini_path, postgui=False)
+    taken = set(joint_pins(cfg))
+    # a CSP drive's joint pins belong to the Joints, connected or not
+    taken |= {"%s.%s" % (name, c[1]) for name in drives(cfg) for c in CONNECTIONS + [HOMING]}
+    have = {p for n in nets(cfg) for p in n.get("pins") or []}
+    have_sig = {n.get("signal") for n in nets(cfg)}
+    # the pins from files in the configuration folder, which can change;
+    # lines elsewhere (LinuxCNC's hallib) keep using the signal's name
+    d = os.path.dirname(os.path.abspath(ini_path))
+    sig = signals([f for f in files if os.path.dirname(os.path.abspath(f)) == d], ini_path)
+    found = {name: pins for name, pins in sig.items() if any(is_own(cfg, x) for x in pins)}
+    out = {}
+    for name, pins in found.items():
+        pins = sorted(pins, key=lambda x: (not is_own(cfg, x), x))
+        if name in have_sig or not any(is_own(cfg, p) for p in pins) or len(pins) < 2:
+            continue
+        if taken & set(pins) or have & set(pins) or any(p.startswith("joint.") and
+                                                         "-sw-in" not in p for p in pins):
+            continue
+        out[name] = pins
+    return out
+
+
+def propose_joints(ini_path, cfg):
+    """{joint: (slave name, scale)} as the user's HAL files connect them,
+    for joints the configuration does not connect yet."""
+    files = user_hal_files(ini_path)
+    sig = signals(files, ini_path)
+    setp = setp_values(files, ini_path)
+    e = read_ini(ini_path)
+    have = {j["joint"] for j in joints(cfg)}
+    out = {}
+    for j, _, _ in ini_joints(ini_path):
+        if j in have:
+            continue
+        pin = "joint.%d.motor-pos-cmd" % j
+        for pins in sig.values():
+            if pin not in pins:
+                continue
+            for name in drives(cfg):
+                if "%s.pos-cmd" % name in pins:
+                    try:
+                        scale = float(resolve(setp.get("%s.pos-scale" % name), e) or 1.0)
+                    except ValueError:
+                        scale = 1.0
+                    out[j] = (name, scale)
+    # the cia402 component of an lcec configuration, replaced by the profile
+    from . import fromlcec
+    f = fromlcec.find(ini_path)
+    if f is not None:
+        for j, v in fromlcec.propose_joints(f, cfg).items():
+            if j not in have and j not in out and j in {n for n, _, _ in ini_joints(ini_path)}:
+                out[j] = v
+    return out
+
+
+# -- HAL lines from quirk files
+
+_PLACE = re.compile(r"\{(name|pin|signal)(?::([0-9A-Fa-fx]+:[0-9A-Fa-fx]+))?\}")
+
+
+def _slave_objects(slave):
+    """{(index, subindex): (pin, HAL direction)} of a slave's pins."""
+    out = {}
+    for kind in ("outputs", "inputs"):
+        for pdo in (slave.get("process-data") or {}).get(kind) or []:
+            for e in pdo.get("entries") or []:
+                if "pin" in e:
+                    try:
+                        out[config.parse_obj(e.get("object"))] = (
+                            "%s.%s" % (slave["name"], e["pin"]), "in" if kind == "outputs" else "out")
+                    except ValueError:
+                        pass
+    return out
+
+
+def quirk_hal(cfg, pin_sig, user_loaded, p):
+    """The HAL lines quirk files give the configuration's slaves:
+    ({component: [instances]}, [functions], [lines]). pin_sig: pin ->
+    signal, as the files will connect them. Notes and refusals go to the
+    plan p."""
+    from . import quirks
+    loads, addf, lines = {}, [], []
+    for s in (cfg or {}).get("slaves") or []:
+        q = quirks.of(s)
+        hal = q.get("hal")
+        if not hal:
+            continue
+        name, objs = s.get("name"), _slave_objects(s)
+        made, why = [], None
+
+        def fill(text):
+            def one(m):
+                nonlocal why
+                kind, o = m.group(1), m.group(2)
+                if kind == "name":
+                    return name
+                obj = config.parse_obj(o)
+                if obj not in objs:
+                    why = why or "%s has no pin" % o
+                    return m.group(0)
+                pin, way = objs[obj]
+                if kind == "pin":
+                    if pin in pin_sig:
+                        why = why or "%s is connected in your HAL files" % pin
+                    return pin
+                if pin in pin_sig:
+                    return pin_sig[pin]
+                if way == "in":
+                    why = why or "nothing drives %s" % pin
+                    return m.group(0)
+                sig = default_signal(pin)
+                if sig not in {x for x in pin_sig.values()}:
+                    made.append("net %s %s" % (sig, pin))
+                pin_sig[pin] = sig
+                return sig
+            return _PLACE.sub(one, text)
+
+        text = [fill(x) for x in hal["lines"]]
+        funcs = [fill(x) for x in hal["addf"]]
+        insts = {c: [fill(x) for x in v] for c, v in hal["load"].items()}
+        clash = sorted(set(insts) & user_loaded)
+        if clash:
+            why = why or "your HAL files load %s, which HAL loads only once" % ", ".join(clash)
+        if why:
+            p.notes.append("%s: the HAL lines of the quirk file %s are left out: %s"
+                           % (name, os.path.basename(q["path"]), why))
+            continue
+        for c, v in insts.items():
+            loads.setdefault(c, []).extend(v)
+        addf += funcs
+        lines += ["# %s: from the quirk file %s" % (name, os.path.basename(q["path"]))] + \
+            made + text
+        p.notes.append("%s: HAL lines from the quirk file %s" % (name, os.path.basename(q["path"])))
+    return loads, addf, lines
+
+
+# -- the plan
+
+@dataclass
+class FileChange:
+    path: str
+    kind: str           # "new" or "change"
+    old: str
+    new: str
+    what: str = ""      # a short description
+
+    @property
+    def name(self):
+        return os.path.basename(self.path)
+
+
+def linuxcnc_tree(path):
+    """What LinuxCNC's own files this path is in: its source tree of a run-in-place build
+    ("run-in-place source tree") or a package's sample configurations; else None. A
+    configuration to change belongs in the user's own folder (~/linuxcnc/configs)."""
+    real = os.path.realpath(path)
+    parent = os.path.dirname(real)
+    while parent and parent != os.path.dirname(parent):
+        if os.path.exists(os.path.join(parent, "scripts", "rip-environment")):
+            return "run-in-place source tree %s" % parent
+        parent = os.path.dirname(parent)
+    for prefix in ("/usr/share/doc/linuxcnc/examples", "/usr/share/linuxcnc"):
+        if real.startswith(prefix + os.sep):
+            return "installed sample configurations (%s)" % prefix
+    return None
+
+
+@dataclass
+class Plan:
+    changes: list = field(default_factory=list)     # [FileChange]
+    commented: list = field(default_factory=list)   # [(file name, line number, text)]
+    errors: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)    # written anyway, after the user confirms
+    notes: list = field(default_factory=list)
+    edited: list = field(default_factory=list)      # ecatsetup's files changed by hand
+
+
+def feedforward_velo(cfg, name):
+    """Whether drive `name` feeds velocity forward (cia402.feedforward), so
+    that its velo-scale must turn machine units/s into the drive's velocity
+    unit (counts/s, the same as pos-scale): ethercat.hal sets it with the
+    pos-scale. Without it 0x60B1 gets machine units/s, pos-scale times too
+    little."""
+    s = drives(cfg).get(name) or {}
+    ff = (s.get("cia402") or {}).get("feedforward")
+    return isinstance(ff, dict) and bool(ff.get("velocity"))
+
+
+def homes_by_drive(cfg, name):
+    """Whether drive `name` may home by its own method (cia402.modes has hm)."""
+    return "hm" in (((drives(cfg).get(name) or {}).get("cia402") or {}).get("modes") or [])
+
+
+def _managed(cfg):
+    """[(joint, drive name, scale, [(joint pin, drive pin, arrow, suffix)])].
+    With cia402_homecomp the second pin may be one of the module's joint pins."""
+    out = []
+    for j in joints(cfg):
+        name = j.get("slave")
+        n = j["joint"]
+        if homes_by_drive(cfg, name) and j.get("homing") == "homecomp":
+            def full(x):
+                return ("joint.%d." % n if x[0] == "J" else name + ".") + x[2:]
+            out.append((n, name, j.get("scale", 1.0),
+                        [(full(a), full(b), arrow, suffix)
+                         for a, b, arrow, suffix in HOMECOMP_CONNECTIONS]))
+            continue
+        conns = list(CONNECTIONS)
+        if homes_by_drive(cfg, name):
+            conns.append(HOMING)
+        out.append((n, name, j.get("scale", 1.0),
+                    [("joint.%d.%s" % (n, a), "%s.%s" % (name, b), arrow, suffix)
+                     for a, b, arrow, suffix in conns]))
+    return out
+
+
+# LinuxCNC's own pins, there before any HAL file's components
+CORE_PREFIXES = {"motion", "iocontrol", "joint", "axis", "spindle"}
+
+
+def _arrow_writers(t):
+    """The pins a net statement writes its signal with, by its arrows."""
+    rest = t[2:]
+    for i, x in enumerate(rest):
+        if x == "=>":
+            return rest[:i]
+        if x == "<=":
+            return [y for y in rest[i + 1:] if y not in ARROWS]
+    return []
+
+
+def _loaded_names(t):
+    from . import wiring
+    return wiring._loaded(t)
+
+
+def _is_ecat_line(t):
+    """A statement that loads lcec or ecat, or adds their functions."""
+    if t[0] == "loadusr" and any("lcec_conf" in x for x in t[1:]):
+        return True
+    if t[0] == "loadrt" and len(t) > 1 and t[1] in ("lcec", "lcec_uspace", "ecat"):
+        return True
+    if t[0] == "addf" and len(t) > 1 and t[1].split(".")[0] in ("lcec", "ecat"):
+        return True
+    return False
+
+
+def plan(ini_path, cfg, yaml_name="ethercat.yaml", max_counts=None):
+    """What writing the configuration into the INI file's configuration
+    would change. Nothing is written. max_counts: see joint_checks()."""
+    p = Plan()
+    d = os.path.dirname(os.path.abspath(ini_path))
+    if not os.path.exists(ini_path):
+        p.errors.append("%s does not exist" % ini_path)
+        return p
+    if ini_path.endswith(EXPANDED):
+        src = expanded_source(ini_path)
+        p.errors.append("%s is the file LinuxCNC writes from %s at every start, with its "
+                        "#INCLUDEs in place: what is written here is lost. Choose %s instead"
+                        % (os.path.basename(ini_path),
+                           os.path.basename(src) if src else "the INI file",
+                           os.path.basename(src) if src else "that INI file"))
+        return p
+    tree = linuxcnc_tree(ini_path)
+    if tree:
+        p.warnings.append(
+            "%s is in LinuxCNC's own files, the %s: writing here changes LinuxCNC's sample "
+            "configuration, not a copy of your own. Copy the folder to ~/linuxcnc/configs first "
+            "(start LinuxCNC with debug_pickconfig=1 to be asked to copy a sample configuration, "
+            "which a run-in-place build otherwise runs where it is), and write there" % (
+                os.path.basename(ini_path), tree))
+    ini_e = read_ini(ini_path)
+    ds = drives(cfg)
+    njoints = len(ini_joints(ini_path))
+    seen = set()
+    for j in joints(cfg):
+        n = j.get("joint")
+        if not isinstance(n, int) or not 0 <= n < njoints:
+            p.errors.append("joint %r: the INI file has %d joints" % (n, njoints))
+        if j.get("slave") not in ds:
+            p.errors.append("joint %s: %r is not a CSP drive in the configuration"
+                            % (n, j.get("slave")))
+        if j.get("slave") in seen:
+            p.errors.append("%s is connected to two joints" % j.get("slave"))
+        seen.add(j.get("slave"))
+    if uses_homecomp(cfg):
+        from . import lcnc_env
+        if not lcnc_env.has_module(HOMECOMP):
+            p.warnings.append(
+                "a joint homes through %s, but LinuxCNC has no such module (%s): LinuxCNC will "
+                "not start until it is installed. Choose index-enable on the homing card, or "
+                "install the module" % (HOMECOMP, lcnc_env.module_dir()))
+        p.notes.append("homing through %s is a test: the module comes from linuxcnc-ethercat "
+                       "and is not released yet; [EMCMOT]HOMEMOD is set" % HOMECOMP)
+    managed = _managed(cfg)
+    managed_pins = {pin for _, _, _, conns in managed for c in conns for pin in c[:2]}
+    io = [n for n in nets(cfg) if isinstance(n, dict) and len(n.get("pins") or []) >= 2]
+    managed_pins |= {pin for n in io for pin in n["pins"]}
+    postgui = set(user_hal_files(ini_path, postgui=True))
+    scale_pins = {"%s.pos-scale" % name for _, name, _, _ in managed}
+    scale_pins |= {"%s.velo-scale" % name for _, name, _, _ in managed if feedforward_velo(cfg, name)}
+
+    # an lcec configuration: its old pins are replaced by the ones chosen
+    # (fromlcec.py), and the cia402 component by the profile
+    from . import fromlcec
+    lcec = fromlcec.find(ini_path)
+
+    def sub(t):
+        return t
+    if lcec is not None:
+        p.errors += lcec.problems
+        p.notes += lcec.notes + fromlcec.glue_notes(lcec, cfg)
+        lrows = fromlcec.rows(lcec, cfg)
+        undecided = [r for r in lrows if not r.decided]
+        if undecided:
+            p.errors.append("%d pin%s of the lcec configuration %s no new pin chosen (the card "
+                            "From lcec): %s" % (
+                                len(undecided), "" if len(undecided) == 1 else "s",
+                                "has" if len(undecided) == 1 else "have",
+                                ", ".join("%s (%s:%d)" % ((r.pin,) + r.uses[0]) for r in undecided)))
+        lmap = {r.pin: r.new for r in lrows if r.decided}
+        lgone = set(fromlcec.replaced(lcec, cfg))
+
+        def sub(t):
+            return fromlcec.substitute(t, lmap, lgone)
+
+    # LIB:basic_sim.tcl builds the simulation when LinuxCNC starts; the file it
+    # saved then is static HAL, and takes its place
+    ini_replace = {}
+    files = []
+    for value, path, _ in hal_entries(ini_path):
+        if os.path.basename(path) == BASIC_SIM:
+            saved = basic_sim_file(ini_path)
+            if saved is None:
+                p.errors.append("%s builds the simulation when LinuxCNC starts, and saves it as "
+                                "%s_cmds.hal: start this configuration once in the simulator, "
+                                "then write again" % (value, os.path.splitext(
+                                    os.path.basename(ini_path))[0]))
+                continue
+            ini_replace[value] = os.path.basename(saved)
+            p.notes.append("%s is replaced by %s, the HAL it built when the configuration ran in "
+                           "the simulator" % (value, os.path.basename(saved)))
+            files.append(saved)
+        else:
+            files.append(path)
+    for path in files:
+        if not path.endswith(".hal") and not is_tcl(path):
+            p.notes.append("%s is not a HAL file; it is not checked for lcec or ecat lines"
+                           % os.path.basename(path))
+    hal_files = [f for f in files if f.endswith(".hal") and os.path.exists(f)]
+    tcl_files = [f for f in files if is_tcl(f) and os.path.exists(f)]
+    # cia402_homecomp's pins exist only for a joint that homes through it: a
+    # line of the user's that uses them for another joint stops LinuxCNC
+    # (such as a cia-timeout-ms left after switching back to index-enable)
+    comp_joints = {j.get("joint") for j in joints(cfg) if j.get("homing") == "homecomp"}
+    for f in hal_files:
+        try:
+            text = read_text(f)
+        except OSError:
+            continue
+        for no, line in enumerate(text.splitlines(), 1):
+            code = line.split("#", 1)[0]
+            for m in re.finditer(r"\bjoint\.(\d+)\.(cia-[\w-]+|request-custom-homing|is-custom-homing)\b", code):
+                if int(m.group(1)) not in comp_joints:
+                    p.warnings.append(
+                        "%s line %d uses %s, a pin of %s, but joint %s does not home through it: "
+                        "LinuxCNC will not start with that line; take it out (or choose %s on "
+                        "the homing card)" % (os.path.basename(f), no, m.group(0), HOMECOMP,
+                                              m.group(1), HOMECOMP))
+    for f in files:
+        if (f.endswith(".hal") or is_tcl(f)) and not os.path.exists(f):
+            p.errors.append("%s is in the INI file but does not exist" % os.path.basename(f))
+
+    # a .tcl file is read as the HAL it gives, but never changed. One with a
+    # line that would be commented out is converted: the HAL it gives is
+    # written as a .hal file of its own (the INI points to it), and the
+    # lines are commented out there
+    virtual = {}             # new .hal path -> its text, for a converted .tcl file
+    virtual_from = {}        # new .hal path -> (the .tcl path, its line of each text line)
+    for path in tcl_files:
+        from . import haltcl
+        try:
+            x = haltcl.expand(path, ini_path)
+        except OSError as e:
+            p.notes.append("%s could not be read as HAL (%s); it is not checked" % (
+                os.path.basename(path), e))
+            continue
+        p.notes += x.problems
+        clash = []          # (Tcl line, what)
+        for a, _, t in statements(x.text):
+            pins = []
+            if _is_ecat_line(t) or sub(t) is not t:
+                pins = [" ".join(t)]
+            elif t[0] == "setp" and len(t) == 3 and t[1] in scale_pins:
+                pins = [t[1]]
+            elif t[0] == "net" and len(t) > 1:
+                pins = [pin for pin in net_pins(t)[1] if pin in managed_pins]
+            if pins:
+                clash.append((x.lines[a] if a < len(x.lines) else 0, pins))
+        if clash:
+            lines = sorted({n for n, _ in clash})
+            what = sorted({pin for _, ps in clash for pin in ps})
+            target = os.path.join(d, os.path.splitext(os.path.basename(path))[0] + ".hal")
+            entry = next((v for v, pth, _ in hal_entries(ini_path) if pth == path), None)
+            if x.problems or entry is None:
+                p.errors.append("%s (line%s %s) connects %s, which ethercat.hal connects now. "
+                                "EtherCAT Setup does not change .tcl files and cannot turn this "
+                                "one into HAL (%s): take those lines out there, or the file out "
+                                "of the INI file" % (
+                                    os.path.basename(path), "" if len(lines) == 1 else "s",
+                                    ", ".join(str(n) for n in lines), ", ".join(what),
+                                    "; ".join(x.problems) or "it is not a HALFILE"))
+                continue
+            if os.path.exists(target):
+                p.errors.append("%s has lines that ethercat.hal replaces, and would be turned into "
+                                "%s, which exists: rename one" % (
+                                    os.path.basename(path), os.path.basename(target)))
+                continue
+            header = ("# Made by EtherCAT Setup from %s: the Tcl file run once with the INI "
+                      "file's values\n# (%d joint%s), as plain HAL. The INI file reads this file "
+                      "now, not the .tcl one.\n# Lines that ethercat.hal replaces are commented "
+                      "out with %s\n\n" % (
+                          os.path.basename(path), njoints, "" if njoints == 1 else "s",
+                          COMMENT.strip()))
+            virtual[target] = header + x.text
+            virtual_from[target] = (path, x.lines)
+            ini_replace[entry] = os.path.basename(target)
+            if path in postgui:
+                postgui.add(target)
+            p.notes.append("%s is turned into %s: the Tcl run once with the INI file's values, "
+                           "as HAL (the .tcl file stays as it is); the lines that clashed "
+                           "(.tcl line%s %s) are commented out there" % (
+                               os.path.basename(path), os.path.basename(target),
+                               "" if len(lines) == 1 else "s", ", ".join(str(n) for n in lines)))
+
+    # what the user's files connect, before any change (a converted .tcl file by its .tcl)
+    old_sig = signals(hal_files + tcl_files, ini_path)
+    hal_files = hal_files + list(virtual)
+
+    def text_of(path):
+        return virtual[path] if path in virtual else read_text(path)
+    # lines to comment out, and the signals they used
+    sig_of_pin = {}          # managed pin -> the signal the user's file put it on
+    kept = {}                # signal -> pins of commented lines that are not managed
+    line_writers = set()     # pins that wrote their signal in a commented line (arrows)
+    # what exists before the GUI: what the HALFILEs load, LinuxCNC's own pins
+    early = set()
+    for path in hal_files + tcl_files:
+        if path in postgui:
+            continue
+        try:
+            text = read_hal(path, ini_path)
+        except OSError:
+            continue
+        for _, _, t in statements(original(text)):
+            early.update(inst for inst, _ in _loaded_names(t))
+
+    def exists_early(pin):
+        return (is_own(cfg, pin) or pin.split(".", 1)[0] in CORE_PREFIXES
+                or any(pin.startswith(inst + ".") for inst in early))
+
+    panel_gone = False
+    for path in hal_files:
+        current = text_of(path)
+        text = original(current)
+        lines = text.splitlines(keepends=True)
+        hit = set()
+        mine = {}            # this file's kept pins
+        after = {}           # last line of a statement -> the line that replaces it
+        dropped = []         # writers of a POSTGUI line that a real pin replaces
+        for a, b, t in statements(text):
+            why = None
+            # a line with old pins (lcec's) goes, or comes back with the new ones
+            t2 = sub(t)
+            renewed = t2 is not t
+            if t2 is None:
+                hit.update(range(a, b + 1))
+                continue
+            t = t2
+            if _is_ecat_line(t):
+                why = True
+            elif t[0] == "setp" and len(t) == 3 and t[1] in scale_pins:
+                why = True
+            elif len(t) == 3 and t[1] == "=" and t[0] in scale_pins:
+                why = True
+            elif t[0] in ("loadusr", "loadrt") and any(x in SIM_PANELS for x in t[1:]):
+                why = True
+                panel_gone = True
+            elif t[0] == "net" and len(t) > 1 and not (managed_pins & set(net_pins(t)[1])) \
+                    and any(_panel_pin(x) for x in net_pins(t)[1]):
+                # the simulation panel is taken out: what else is on the signal stays
+                why = True
+                panel_gone = True
+                keep = [x for x in t if not _panel_pin(x)]
+                while keep and keep[-1] in ARROWS:
+                    keep.pop()
+                if len(keep) > 2:
+                    after[b] = " ".join(keep) + ADDED + "\n"
+            elif t[0] == "net" and len(t) > 1:
+                name, pins = net_pins(t)
+                if managed_pins & set(pins):
+                    why = True
+                    wrote = _arrow_writers(t)
+                    line_writers.update(wrote)
+                    for pin in pins:
+                        if pin in managed_pins:
+                            sig_of_pin.setdefault(pin, name)
+                        elif path not in postgui:
+                            mine.setdefault(name, []).append(pin)
+                    if path in postgui:
+                        # the GUI's own readers stay on the signal, after the GUI
+                        # is up; a writer gives way to the real pin
+                        rest = [x for x in pins if x not in managed_pins and x not in wrote
+                                and not _panel_pin(x)]
+                        panel_gone = panel_gone or any(_panel_pin(x) for x in pins)
+                        dropped += [x for x in wrote if x not in managed_pins
+                                    and not _panel_pin(x)]
+                        if rest:
+                            # the signal ethercat.hal connects the pin to
+                            ours = [x for x in pins if x in managed_pins]
+                            sig = sig_of_pin.get(ours[0], name) if ours else name
+                            after[b] = "net %s => %s%s\n" % (sig, " ".join(rest), ADDED)
+            if renewed and not why:
+                why = True
+                after.setdefault(b, " ".join(t) + ADDED + "\n")
+            if why:
+                hit.update(range(a, b + 1))
+        if hit and path in postgui:
+            moved = sorted({pin for a, b, t0 in statements(text) if a in hit
+                            for t in [sub(t0)] if t and t[0] == "net"
+                            for pin in net_pins(t)[1] if pin in managed_pins})
+            late = [x for x in moved if not exists_early(x)]
+            if late:
+                p.errors.append("%s (a POSTGUI file, read after ethercat.hal) connects %s: "
+                                "connect the signal there, not the pin, or connect it by hand"
+                                % (os.path.basename(path), ", ".join(late)))
+                continue
+            if dropped:
+                p.notes.append("%s: %s no longer connected (a real input or output takes "
+                               "its place)" % (os.path.basename(path), ", ".join(dropped)))
+        for name, pins in mine.items():
+            kept.setdefault(name, []).extend(pins)
+        copy_to = None
+        if hit and os.path.dirname(os.path.abspath(path)) != d and text == current:
+            # LinuxCNC's own file (hallib) is never changed: a copy in the folder
+            # takes its place (HALLIB_PATH finds the folder's first)
+            copy_to = os.path.join(d, os.path.basename(path))
+            if os.path.exists(copy_to):
+                p.errors.append("%s is in the folder and in %s: rename one" % (
+                    os.path.basename(path), os.path.dirname(path)))
+                continue
+            for value, epath, _ in hal_entries(ini_path):
+                if epath == path and value.startswith("LIB:"):
+                    ini_replace[value] = value[4:]
+        new = []
+        for i, line in enumerate(lines):
+            if i in hit:
+                p.commented.append((os.path.basename(path), i + 1, line.rstrip("\n")))
+                new.append(COMMENT + line)
+                if i in after:
+                    new.append(after[i])
+            else:
+                new.append(line)
+        new = "".join(new)
+        if copy_to is not None:
+            p.changes.append(FileChange(copy_to, "new", "", new, "copied from LinuxCNC's %s, "
+                                        "%d line%s commented out" % (
+                                            os.path.dirname(path), len(hit),
+                                            "" if len(hit) == 1 else "s")))
+            p.notes.append("%s is copied into the configuration folder and changed there; "
+                           "LinuxCNC's own file is not" % os.path.basename(path))
+            continue
+        if path in virtual:
+            tcl, tcl_lines = virtual_from[path]
+            n = len(hit)
+            p.changes.append(FileChange(path, "new", "", new, "%s as HAL, %d line%s commented out" % (
+                os.path.basename(tcl), n, "" if n == 1 else "s")))
+        elif new != current:
+            before = {i for i, x in enumerate(current.splitlines()) if x.startswith(COMMENT)}
+            back = len(before - hit)
+            parts = []
+            if hit:
+                parts.append("%d line%s commented out" % (len(hit), "" if len(hit) == 1 else "s"))
+            if back:
+                parts.append("%d back as you wrote %s" % (back, "it" if back == 1 else "them"))
+            p.changes.append(FileChange(path, "change", current, new, ", ".join(parts)))
+
+    if panel_gone:
+        p.notes.append("The simulation panel (%s) is taken out: its lines are commented out "
+                       "with %s, what else was on its signals stays" % (
+                           ", ".join(SIM_PANELS), COMMENT.strip()))
+
+    # signal names: the user's where there was one, else the one ethercat.hal
+    # gave the pin before (other files may read that signal: custom_postgui.hal's
+    # "net x-enable delay-x-ferror.in" must stay on the joint's enable)
+    before = {}
+    for _, _, t in statements(original(read_text(os.path.join(d, MAIN_FILE)))
+                              if os.path.exists(os.path.join(d, MAIN_FILE)) else ""):
+        if t[0] == "net" and len(t) > 1:
+            name, pins = net_pins(t)
+            for pin in pins:
+                before[pin] = name
+    letters = {j: letter for j, letter, _ in ini_joints(ini_path)}
+    count = {}
+    for letter in letters.values():
+        count[letter] = count.get(letter, 0) + 1
+    used = set(old_sig)
+    driven = set()           # signals ethercat.hal gives a writer
+    io_signals = set()       # signals ethercat.hal gives a handshake pin (index-enable)
+    body = ["addf ecat.read-all  servo-thread 1", "addf ecat.write-all servo-thread", ""]
+    for n, name, scale, conns in managed:
+        letter = letters.get(n, "")
+        base = letter.lower() if letter and count.get(letter) == 1 else \
+            ("%s%d" % (letter.lower(), n) if letter else "j%d" % n)
+        body.append("# joint %d%s: %s" % (n, " (%s)" % letter if letter else "", name))
+        body.append("setp %s.pos-scale %r" % (name, float(scale)))
+        if feedforward_velo(cfg, name):
+            # 0x60B1 is in the drive's velocity unit, counts/s like pos-scale's counts
+            body.append("setp %s.velo-scale %r" % (name, float(scale)))
+        this = {}            # pin -> its signal in this joint's lines
+        for jpin, dpin, arrow, suffix in conns:
+            if jpin in this or dpin in this:
+                # one more pin on a signal of this joint (cia402_homecomp's)
+                sig = this.get(jpin) or this.get(dpin)
+                body.append("net %s %s" % (sig, dpin if jpin in this else jpin))
+                this[jpin] = this[dpin] = sig
+                continue
+            a, b = sig_of_pin.get(jpin), sig_of_pin.get(dpin)
+            cmd_sig = sig_of_pin.get("joint.%d.motor-pos-cmd" % n)
+            if suffix == "pos-fb" and a is not None and a == cmd_sig:
+                # a simulation looped the command back as feedback (core_sim.hal):
+                # the feedback is the drive's now, on a signal of its own
+                p.notes.append("joint %d: the simulation looped motor-pos-cmd back to "
+                               "motor-pos-fb (signal %s); the feedback comes from %s now"
+                               % (n, a, name))
+                a = None
+            if a and b and a != b:
+                p.errors.append("%s and %s are on different signals in your HAL files (%s, %s): "
+                                "something sits between the joint and the drive; connect them "
+                                "by hand" % (jpin, dpin, a, b))
+            sig = a or b or before.get(jpin) or before.get(dpin)
+            if sig is not None and sig in this.values():
+                # with the module between them, the joint's old signal
+                # (motor-pos-fb, amp-enable-out) is not the drive's any more
+                sig = None
+            if sig is None:
+                sig = "%s-%s" % (base, suffix)
+                if sig in used:
+                    sig = "ecat-" + sig
+            used.add(sig)
+            driven.add(sig)
+            this[jpin] = this[dpin] = sig
+            if arrow == "<=":
+                body.append("net %s %s => %s" % (sig, dpin, jpin))
+            elif arrow == "<=>":
+                body.append("net %s %s <=> %s" % (sig, jpin, dpin))
+            else:
+                body.append("net %s %s => %s" % (sig, jpin, dpin))
+        if any(c[1] == "joint.%d.cia-pos-fb-out" % n for c in conns):
+            body.append("setp joint.%d.request-custom-homing 1" % n)
+            body.append("setp %s.home-hold 1" % name)
+        body.append("")
+    prm = params(cfg)
+    if prm:
+        body.append("# parameters")
+        user_setp = setp_values(hal_files, ini_path)
+        for e in prm:
+            body.append("setp %s %s" % (e["pin"], param_text(e["value"])))
+            if e["pin"] in user_setp:
+                p.notes.append("%s is set in your HAL files too (to %s); ethercat.hal is read "
+                               "last and wins: take it out there" % (e["pin"], user_setp[e["pin"]]))
+        body.append("")
+    if io:
+        body.append("# inputs and outputs")
+    own = slave_pins(cfg)
+    for n in io:
+        pins = list(dict.fromkeys(n["pins"]))
+        theirs = [sig_of_pin[x] for x in pins if x in sig_of_pin]
+        sig = n.get("signal") or default_signal(pins[0])
+        if theirs:
+            if len(set(theirs)) > 1:
+                p.errors.append("%s are on different signals in your HAL files (%s): connect "
+                                "them by hand" % (", ".join(x for x in pins if x in sig_of_pin),
+                                                  ", ".join(sorted(set(theirs)))))
+            if theirs[0] != sig:
+                p.notes.append("signal %s is called %s in your HAL files; that name is kept"
+                               % (sig, theirs[0]))
+            sig = theirs[0]
+        elif sig in used:
+            p.errors.append("signal %s is used in your HAL files already: choose another name "
+                            "or connect it there" % sig)
+        used.add(sig)
+
+        def way(x):
+            return (own.get(x) or known_pin(x) or (None, None))[1]
+        writers = [x for x in pins if way(x) == "out"]
+        if writers:
+            driven.add(sig)
+        if any(way(x) == "io" for x in pins):
+            io_signals.add(sig)
+        if not writers and len(pins) == 2 and all(way(x) == "io" for x in pins):
+            body.append("net %s %s <=> %s" % (sig, pins[0], pins[1]))
+        elif len(writers) == 1:
+            rest = [x for x in pins if x != writers[0]]
+            body.append("net %s %s => %s" % (sig, writers[0], " ".join(rest)))
+        else:
+            body.append("net %s %s" % (sig, " ".join(pins)))
+    if io:
+        body.append("")
+    # a signal ethercat.hal drives now loses the writers of the lines commented
+    # out: a simulated home switch, the simulation's E-stop loop-back
+    for s_name in list(kept):
+        if s_name in driven:
+            gone = [x for x in kept[s_name] if (known_pin(x) or (None, None))[1] == "out"
+                    or _WRITER.search(x) or x in line_writers]
+            if gone:
+                kept[s_name] = [x for x in kept[s_name] if x not in gone]
+                p.notes.append("signal %s: %s no longer writes it (a real input does now)"
+                               % (s_name, ", ".join(dict.fromkeys(gone))))
+                # a simulated switch shared by joints (X and Z on one or2) is
+                # not the other joint's real switch: each is connected on its own
+                shared = [x for x in kept[s_name] if _SWITCH.match(x)]
+                if shared:
+                    kept[s_name] = [x for x in kept[s_name] if x not in shared]
+                    p.notes.append("signal %s: %s left unconnected; the simulation shared the "
+                                   "switch, a machine has one each: connect its own input"
+                                   % (s_name, ", ".join(shared)))
+    # a handshake pin (index-enable) of a real encoder replaces the simulated one: two
+    # encoders on one index-enable would answer each other
+    if io_signals and any(kept.get(x) for x in io_signals):
+        from . import wiring
+        g = wiring.graph(ini_path, cfg)
+        for s_name in sorted(io_signals):
+            gone = [x for x in kept.get(s_name, []) if wiring.is_sim(g, x)]
+            if gone:
+                kept[s_name] = [x for x in kept[s_name] if x not in gone]
+                p.notes.append("signal %s: %s no longer on it (a real pin takes its place)"
+                               % (s_name, ", ".join(dict.fromkeys(gone))))
+    extra = [(s, pins) for s, pins in kept.items() if pins]
+    if extra:
+        body.append("# other pins of lines commented out in your HAL files")
+        for s, pins in extra:
+            body.append("net %s %s" % (s, " ".join(dict.fromkeys(pins))))
+        body.append("")
+
+    # HAL lines from quirk files, with the signals as they are now
+    pin_sig = {}
+    for sig_name, sig_pins in old_sig.items():
+        for pin in sig_pins:
+            pin_sig.setdefault(pin, sig_name)
+    for line in body:
+        t = line.split("#", 1)[0].split()
+        if t and t[0] == "net" and len(t) > 2:
+            for pin in net_pins(t)[1]:
+                pin_sig[pin] = t[1]
+    user_loaded = set()
+    for path in hal_files:
+        for _, _, t in statements(original(text_of(path))):
+            if t[0] == "loadrt" and len(t) > 1:
+                user_loaded.add(t[1])
+    q_loads, q_addf, q_lines = quirk_hal(cfg, pin_sig, user_loaded, p)
+    if q_addf:
+        # after ecat.read-all, before ecat.write-all
+        body[1:1] = ["addf %s servo-thread" % f for f in q_addf]
+    if q_lines:
+        body += q_lines + [""]
+    if q_loads:
+        body[0:0] = ["loadrt %s names=%s" % (comp, ",".join(names))
+                     for comp, names in sorted(q_loads.items())]
+
+    load = HEADER + "\n# Loads the component before the other HAL files, so that the slaves'\n" \
+        "# pins exist for them.\n"
+    if check_at_start(cfg):
+        load += "\n# linuxcnc.check-hal-at-start: the HAL files against the configuration, before\n" \
+            "# anything is loaded (ecatsetup --check-hal reads INI_FILE_NAME)\n" \
+            "loadusr -w ecatsetup --check-hal\n"
+    load += "loadrt ecat config=[ETHERCAT]CONFIG\n"
+    main = HEADER + "\n# The last HALFILE: the servo thread exists now. ecat.read-all goes first\n" \
+        "# in the thread, ecat.write-all last.\n" + "\n".join(body).rstrip() + "\n"
+    from . import halcheck
+    for fname, text, what in ((LOAD_FILE, load, "loads ecat"),
+                              (MAIN_FILE, main, "functions and joints")):
+        text = halcheck.with_checksum(text)
+        path = os.path.join(d, fname)
+        old = read_text(path) if os.path.exists(path) else ""
+        if old and halcheck.edited(old):
+            p.edited.append(fname)
+        if old != text:
+            p.changes.append(FileChange(path, "change" if old else "new", old, text, what))
+    homemod = HOMECOMP if uses_homecomp(cfg) else None
+    for path, new_ini in ini_texts(ini_path, yaml_name, ini_replace, homemod).items():
+        old_ini = read_text(path)
+        if new_ini != old_ini:
+            p.changes.append(FileChange(path, "change", old_ini, new_ini,
+                                        "[ETHERCAT]CONFIG and the HAL files" if path == ini_path
+                                        else "[ETHERCAT]CONFIG and the HAL files (#INCLUDEd by %s)"
+                                        % os.path.basename(ini_path)))
+    p.notes += joint_checks(ini_path, cfg, max_counts)
+    for path in hal_files:
+        what = SIM_FILES.get(os.path.basename(path))
+        if what:
+            p.notes.append("%s still simulates %s: connect the real ones (Joints, Inputs and "
+                           "outputs), then take it out of the INI file" % (
+                               os.path.basename(path), what))
+    if not managed and not io and not prm:
+        p.notes.append("no joint or pin is connected here: ethercat.hal only adds the "
+                       "component's functions; your HAL files keep their connections")
+    for j, _, _ in ini_joints(ini_path) if managed else []:
+        if j not in {m[0] for m in managed}:
+            p.notes.append("joint %d is not connected here (it is connected in your HAL files, "
+                           "or not on EtherCAT)" % j)
+    for v in ini_all(ini_e, "HAL", "POSTGUI_HALFILE"):
+        path = find_hal_file(d, v.split()[0]) if v.split() else ""
+        try:
+            late = [t[1] for _, _, t in statements(original(read_text(path)))
+                    if t[0] == "addf" and len(t) > 2 and t[2] == "servo-thread"]
+        except OSError:
+            late = []
+        if late:
+            p.notes.append("%s adds %s to the servo thread after ecat.write-all: their outputs "
+                           "reach the slaves a cycle later" % (os.path.basename(path),
+                                                               ", ".join(late)))
+    return p
+
+
+def apply(p, overwrite_edited=False):
+    """Write a plan's files; each existing file is kept as .bak first.
+    Returns the paths written. A file of ecatsetup's own that was changed
+    by hand is replaced only with overwrite_edited."""
+    if p.errors:
+        raise ValueError("not written:\n  " + "\n  ".join(p.errors))
+    if p.edited and not overwrite_edited:
+        raise ValueError("not written: %s changed by hand since EtherCAT Setup wrote it; move "
+                         "the change into a HAL file of your own, or write anyway"
+                         % ", ".join(p.edited))
+    written = []
+    for c in p.changes:
+        if os.path.exists(c.path):
+            shutil.copyfile(c.path, c.path + ".bak")
+        tmp = c.path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(c.new)
+        shutil.copymode(c.path, tmp) if os.path.exists(c.path) else None
+        os.replace(tmp, c.path)
+        written.append(c.path)
+    return written
+
+
+def describe(p, out=print):
+    """A plan as text: the files, then each change as a diff."""
+    import difflib
+    for c in p.changes:
+        out("%s %s (%s)" % ("new   " if c.kind == "new" else "change", c.path, c.what))
+    for c in p.changes:
+        out("")
+        if c.kind == "new":
+            out("--- %s (new)" % c.name)
+            out(c.new.rstrip())
+        else:
+            out("".join(difflib.unified_diff(c.old.splitlines(keepends=True),
+                                             c.new.splitlines(keepends=True),
+                                             c.name + ".bak", c.name, n=1)).rstrip())
+    for n in p.notes:
+        out("note: %s" % n)
+    for w in p.warnings:
+        out("warning: %s" % w)
+    for f in p.edited:
+        out("warning: %s was changed by hand since EtherCAT Setup wrote it; writing replaces "
+            "the change (the diff above shows it as removed)" % f)
+    for e in p.errors:
+        out("error: %s" % e)
