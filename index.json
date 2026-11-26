@@ -24,6 +24,18 @@
    "upvotes": 1,
    "url": "https://github.com/MetalMusings/ecat-devices-test/discussions/1",
    "vendor": "0x00000099"
+  },
+  {
+   "author": "MetalMusings",
+   "discussion": 3,
+   "facts": 1,
+   "name": "ECT60V202(COE)",
+   "path": "devices/00000a88-0a880002/3.yaml",
+   "product": "0x0A880002",
+   "reports": [],
+   "upvotes": 1,
+   "url": "https://github.com/MetalMusings/ecat-devices-test/discussions/3",
+   "vendor": "0x00000A88"
   }
  ],
  "format": 1
