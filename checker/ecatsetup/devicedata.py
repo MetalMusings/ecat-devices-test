@@ -472,12 +472,36 @@ def share(raw):
     s = strip(raw)
     m = s.get("match") or {}
     title = "%s (vendor %s, product %s)" % (s.get("name", "device"), m.get("vendor"), m.get("product"))
-    body = ("Shared from EtherCAT Setup. Contributions are %s.\n\n"
-            "Write here what the device is, and how the facts were found.\n\n"
-            "```yaml\n%s```\n" % (LICENCE, yaml.safe_dump(s, sort_keys=False, allow_unicode=True)))
+    body = ("%s %s.\n\n%s\n\n```yaml\n%s```\n" % (
+        SHARED_FROM, LICENCE, WRITE_HERE, yaml.safe_dump(s, sort_keys=False, allow_unicode=True)))
     q = urllib.parse.urlencode({"category": CATEGORY, "title": title, "body": body},
                                quote_via=urllib.parse.quote)
     return title, body, "https://github.com/%s/discussions/new?%s" % (REPO, q)
+
+
+SHARED_FROM = "Shared from EtherCAT Setup. Contributions are"
+WRITE_HERE = "Write here what the device is, and how the facts were found."
+
+
+def post_words(body):
+    """What the sender wrote in a post, besides the file and the standard lines
+    (for the index: the list in the window shows it)."""
+    text = _FENCE.sub("", body or "")
+    lines = [ln for ln in text.splitlines() if not ln.startswith(SHARED_FROM) and ln.strip() != WRITE_HERE]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()[:500]
+
+
+def describe(entry):
+    """A shared file in one line for the list: number, name, its facts, who and when,
+    votes and reports."""
+    raw = entry.get("raw") or {}
+    names = [label(p) for p in facts(raw)]
+    what = ", ".join(names[:2]) + (" and %d more" % (len(names) - 2) if len(names) > 2 else "") \
+        if names else "no facts"
+    who = ", ".join(x for x in (entry.get("author"), (entry.get("created") or "")[:10]) if x)
+    return "#%s · %s · %s · %s · %d up, %s" % (
+        entry.get("discussion"), raw.get("name", "?"), what, who or "?", entry.get("upvotes") or 0,
+        summary(entry.get("reports")))
 
 
 _FENCE = re.compile(r"^```[ \t]*(\S*)[^\n]*\n(.*?)^```", re.M | re.S)
@@ -494,6 +518,39 @@ def from_post(body):
                 raise Error("the YAML block cannot be read: %s" % e)
             return data
     raise Error("no ```yaml block with the quirk file in the post")
+
+
+def from_text(text):
+    """A quirk file from text from anywhere (a file, a forum post): the YAML itself,
+    or the first ```yaml block in it. Raises Error."""
+    text = text or ""
+    if len(text) > 256 * 1024:
+        raise Error("more than 256 KB: not a quirk file")
+    if "```" in text:
+        return from_post(text)
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise Error("not YAML: %s" % e)
+    if not isinstance(data, dict):
+        raise Error("not a quirk file (a YAML mapping)")
+    return data
+
+
+def imported(raw, ident, ref):
+    """A quirk file read from elsewhere as an entry like shared_for's: checked here,
+    and refused for another device. ref says where it came from (a file, "pasted")."""
+    problems = check(raw)
+    m = (raw or {}).get("match") if isinstance(raw, dict) else None
+    if isinstance(m, dict) and not problems:
+        try:
+            q = quirks.parse({"match": m})
+            if ident not in q["matches"]:
+                problems.append("it is for another device (vendor %s, product %s)" % (m.get("vendor"), m.get("product")))
+        except quirks.QuirkError as e:
+            problems.append(str(e))
+    return {"path": ref, "raw": raw, "problems": problems, "discussion": None, "url": None,
+            "author": None, "upvotes": 0, "reports": [], "ref": ref}
 
 
 def repo_path(raw, number):
@@ -637,6 +694,7 @@ def shared_for(ident):
         out.append({"path": rel, "raw": raw, "problems": check(raw),
                     "discussion": e.get("discussion"), "url": e.get("url"),
                     "author": e.get("author"), "upvotes": e.get("upvotes", 0),
+                    "created": e.get("created"), "words": e.get("words") or "",
                     "reports": e.get("reports") or []})
     worked = lambda x: sum(1 for r in x["reports"] if r.get("result") == "worked")
     out.sort(key=lambda x: (bool(x["problems"]), -worked(x), -(x["upvotes"] or 0), x["path"]))
@@ -663,7 +721,7 @@ def take(ident, name, entry, path):
     """Keep one fact of a fetched file in the user's own quirk file; its source
     says where it came from (and the source the sharer gave)."""
     raw = entry["raw"]
-    src = {"kind": "shared", "ref": entry.get("url") or entry.get("path"),
+    src = {"kind": "shared", "ref": entry.get("url") or entry.get("ref") or entry.get("path"),
            "by": entry.get("author"), "date": today()}
     given = (raw.get("sources") or {}).get(key(path))
     if given:

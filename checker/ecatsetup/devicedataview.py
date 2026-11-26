@@ -8,32 +8,47 @@ import html
 import os
 import urllib.parse
 
-from PyQt5.QtCore import Qt, QUrl
+from PyQt5.QtCore import QTimer, Qt, QUrl
 from PyQt5.QtGui import QDesktopServices
-from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-                             QHBoxLayout, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
+from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+                             QFormLayout, QHBoxLayout, QInputDialog, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
                              QRadioButton, QScrollArea, QTextBrowser, QVBoxLayout)
 
 from . import devicedata, measured, quirks, settings, testmode, tool, tuning
 from .gui import TITLE, label
 
-# where each card is: (the tab's page, the card) from the main window; devicedata.KINDS
-# names a fact's card by these ids
+# where each card is, from the main window: (the tab's page, the card, the card shown
+# instead while it is hidden, when it shows). devicedata.KINDS names a fact's card by
+# these ids
+_BENCH = "It shows on the Workbench while the workbench runs: Start the workbench."
 CARDS = {
-    "settings": ("bus", lambda w: w.bus_page, lambda w: w.slave_page.settings_card),
-    "process-data": ("bus", lambda w: w.bus_page, lambda w: w.slave_page.pd_card),
-    "homing": ("bus", lambda w: w.bus_page, lambda w: w.slave_page.homing_card),
-    "sdo": ("workbench", lambda w: w.test_page, lambda w: w.test_page.sdo_card),
-    "switches": ("workbench", lambda w: w.test_page, lambda w: w.test_page.switches),
-    "move": ("workbench", lambda w: w.test_page, lambda w: w.test_page.move),
-    "response": ("workbench", lambda w: w.test_page, lambda w: w.test_page.response),
-    "sync": ("live", lambda w: w.live_page, lambda w: w.live_page.sync),
-    "from-lcec": ("hal", lambda w: w.hal_page, lambda w: w.hal_page.lcec_card),
+    "settings": (lambda w: w.bus_page, lambda w: w.slave_page.settings_card, None, ""),
+    "process-data": (lambda w: w.bus_page, lambda w: w.slave_page.pd_card, None, ""),
+    "homing": (lambda w: w.bus_page, lambda w: w.slave_page.homing_card, lambda w: w.slave_page.op_card,
+               "It shows for a CiA 402 drive with homing among its modes: tick Homing (hm) under "
+               "Operation and sync."),
+    "sdo": (lambda w: w.test_page, lambda w: w.test_page.sdo_card, None, ""),
+    "switches": (lambda w: w.test_page, lambda w: w.test_page.switches,
+                 lambda w: w.test_page.start_card, _BENCH),
+    "move": (lambda w: w.test_page, lambda w: w.test_page.move, lambda w: w.test_page.start_card, _BENCH),
+    "response": (lambda w: w.test_page, lambda w: w.test_page.response,
+                 lambda w: w.test_page.start_card, _BENCH),
+    "sync": (lambda w: w.live_page, lambda w: w.live_page.sync, lambda w: w.live_page.source,
+             "It shows on the Live tab while something runs: the workbench, or a watched LinuxCNC."),
+    "from-lcec": (lambda w: w.hal_page, lambda w: w.hal_page.lcec_card, None,
+                  "It shows when the INI file's configuration is an lcec one."),
 }
 CARD_NAMES = {"settings": "Settings", "process-data": "Process data", "homing": "Homing by the drive",
               "sdo": "SDO", "switches": "Switches", "move": "Move", "response": "Response",
               "sync": "Synchronisation", "from-lcec": "From lcec"}
 UNKNOWNS_SETTING = "device-data-unknowns"
+NOTHING_TO_SHARE = (
+    "You have no facts of your own about %s yet: what came with the program is shared already.\n\n"
+    "Remember what you learn about the device where you learn it, then share it here:\n"
+    "- a setting: choose it on the Settings card, then Remember for the device type...\n"
+    "- a command: Run command... on the Workbench's SDO card, for an object not known as one\n"
+    "- which input is which: test a switch on the Switches card, then Name input bit...\n\n"
+    "Your pin names and scales are never shared.")
 
 KINDS = [("tried", "Tried on this machine"), ("manual", "The device's manual"),
          ("other", "Somewhere else")]
@@ -156,23 +171,41 @@ def open_url(url):
 
 
 def show_card(win, position, card):
-    """Bring a card into view, for the chosen slave: the card owns the fact."""
+    """Bring a card into view, for the chosen slave: the card owns the fact. A card
+    hidden now (no homing mode, no workbench running) is not there to show: the card
+    that leads to it is shown instead, and the status line says when it shows.
+    Returns (the card shown, why the card itself is not, or "")."""
     if card not in CARDS:
-        return None
-    _, page, widget = CARDS[card]
+        return None, ""
+    page, widget, instead, when = CARDS[card]
     if isinstance(position, int):
         win.select_slave(position)
-    win.show_tab(page(win))
-    w = widget(win)
+    tab = page(win)
+    win.show_tab(tab)
     QApplication.processEvents()
-    p = w.parentWidget()
-    while p is not None and not isinstance(p, QScrollArea):
-        p = p.parentWidget()
-    if p is not None:
-        p.ensureWidgetVisible(w, 0, 0)
+    w = widget(win)
+    why = ""
+    if not w.isVisibleTo(tab):
+        why = "The %s card is not shown now. %s" % (CARD_NAMES.get(card, card), when)
+        w = instead(win) if instead else tab
+        win.status(why)
     win.raise_()
     win.activateWindow()
-    return w
+    # after the tab is laid out: scrolling at once uses the old geometry
+    reveal(w)
+    QTimer.singleShot(50, lambda: reveal(w))
+    return w, why
+
+
+def reveal(w):
+    try:
+        p = w.parentWidget()
+        while p is not None and not isinstance(p, QScrollArea):
+            p = p.parentWidget()
+        if p is not None:
+            p.ensureWidgetVisible(w, 0, 0)
+    except RuntimeError:        # the window went meanwhile
+        pass
 
 
 def _mark(src, mine):
@@ -242,12 +275,15 @@ class DeviceDataDialog(QDialog):
     Share yours, Fetch shared ones and go through a file's facts one by one."""
 
     def __init__(self, win, position):
-        super().__init__(win)
+        # a window of its own, not kept above the main window: its card links bring a card
+        # into view there (MainWindow keeps the reference and closes it with itself)
+        super().__init__(None)
+        self.setWindowFlags(Qt.Window)
         self.win, self.position = win, position
         self.slave, self.ident, self.name, self.revision = device(win, position)
         self.setWindowTitle("Device data - %s" % TITLE)
         self.resize(980, 760)
-        self.files, self.rows, self.at, self.used = [], [], 0, []
+        self.files, self.rows, self.at, self.used, self.imports = [], [], 0, [], []
         lay = QVBoxLayout(self)
         lay.addWidget(label("<b>%s</b> &nbsp; vendor 0x%08X, product 0x%08X%s &nbsp; "
                             "<span style='color:#b45309'>prototype</span>" % (
@@ -290,6 +326,15 @@ class DeviceDataDialog(QDialog):
         self.fetch_button = QPushButton("Fetch shared data")
         self.fetch_button.clicked.connect(self.fetch)
         row.addWidget(self.fetch_button)
+        self.open_button = QPushButton("Open a file...")
+        self.open_button.setToolTip("A quirk file from elsewhere, such as a forum post: checked, then its facts "
+                                    "one by one like a fetched one")
+        self.open_button.clicked.connect(lambda: self.open_file())
+        row.addWidget(self.open_button)
+        self.paste_button = QPushButton("Paste...")
+        self.paste_button.setToolTip("Paste a quirk file, or a post with one in a ```yaml block")
+        self.paste_button.clicked.connect(lambda: self.paste())
+        row.addWidget(self.paste_button)
         self.fetched = label("", "hint")
         row.addWidget(self.fetched, 1)
         lay.addLayout(row)
@@ -353,13 +398,17 @@ class DeviceDataDialog(QDialog):
         res = measured.results(self.ident)
         unknown = devicedata.unknowns(self.slave, now, res) if self.unknown_box.isChecked() else []
         e = self.entry() if self.whole_button.isChecked() else None
-        other = ("Shared file #%s by %s" % (e.get("discussion"), e.get("author") or "?"), e["raw"]) \
+        other = (("Shared file #%s by %s" % (e.get("discussion"), e.get("author") or "?")
+                  if e.get("discussion") is not None else "The file from %s" % e["ref"]), e["raw"]) \
             if e is not None and not e["problems"] else None
         bar = self.page.verticalScrollBar().value()
         self.page.setHtml(page_html(self.name, self.ident, self.revision, self.esi_line(), now, own,
                                     unknown, measured.describe(res), other))
         self.page.verticalScrollBar().setValue(bar)
-        self.share_button.setEnabled(bool(own))
+        self.share_button.setToolTip(
+            "Post your facts for this device (not your pin names or scales) so that others can use "
+            "them; needs a GitHub account" if devicedata.facts(devicedata.strip(own)) else
+            "Nothing of yours to share yet: remember a fact first (press to see how)")
 
     def unknown_toggled(self, on):
         try:
@@ -390,7 +439,8 @@ class DeviceDataDialog(QDialog):
 
     def share(self, confirm=True):
         own = devicedata.read_raw(devicedata.own_path(self.ident))
-        if not own:
+        if not own or not [f for f in devicedata.facts(devicedata.strip(own))]:
+            QMessageBox.information(self, TITLE, NOTHING_TO_SHARE % self.name)
             return None
         s = devicedata.strip(own)
         problems = devicedata.check(s)
@@ -432,16 +482,17 @@ class DeviceDataDialog(QDialog):
     def show_files(self):
         f = devicedata.fetched()
         self.fetched.setText("Fetched %s." % f["time"].replace("T", " ") if f else "Not fetched yet.")
-        self.files = devicedata.shared_for(self.ident)
+        self.files = self.imports + devicedata.shared_for(self.ident)
         self.file_box.blockSignals(True)
         self.file_box.clear()
         for e in self.files:
-            self.file_box.addItem("#%s by %s: %d up, %s%s" % (
-                e.get("discussion"), e.get("author") or "?", e.get("upvotes") or 0,
-                devicedata.summary(e.get("reports")), " (REFUSED by the check)" if e["problems"] else ""))
+            refused = " (REFUSED by the check)" if e["problems"] else ""
+            if e.get("discussion") is None:
+                self.file_box.addItem("From %s%s" % (e["ref"], refused))
+            else:
+                self.file_box.addItem(devicedata.describe(e) + refused)
         self.file_box.blockSignals(False)
-        for w in (self.file_box, self.thread_button, self.report_button):
-            w.setVisible(bool(self.files))
+        self.file_box.setVisible(bool(self.files))
         if not self.files:
             self.file_info.setText("Nothing shared for this device%s." % ("" if f else " yet: fetch first"))
         self.file_chosen()
@@ -450,9 +501,49 @@ class DeviceDataDialog(QDialog):
         i = self.file_box.currentIndex()
         return self.files[i] if 0 <= i < len(self.files) else None
 
+    def take_in(self, text, ref):
+        """A quirk file from elsewhere: checked, put first among the files, chosen."""
+        try:
+            raw = devicedata.from_text(text)
+        except devicedata.Error as e:
+            QMessageBox.warning(self, TITLE, "Not read: %s" % e)
+            return None
+        e = devicedata.imported(raw, self.ident, ref)
+        self.imports = [x for x in self.imports if x["ref"] != ref] + [e]
+        self.show_files()
+        self.file_box.setCurrentIndex(self.files.index(e))
+        self.file_chosen()
+        return e
+
+    def open_file(self, path=None):
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(self, "Open a quirk file - %s" % TITLE, os.path.expanduser("~"),
+                                                  "Quirk files (*.yaml *.yml *.txt);;All files (*)")
+        if not path:
+            return None
+        try:
+            with open(path, errors="replace") as f:
+                text = f.read(256 * 1024 + 1)
+        except OSError as e:
+            QMessageBox.warning(self, TITLE, "Could not read %s: %s" % (path, e))
+            return None
+        return self.take_in(text, os.path.basename(path))
+
+    def paste(self, text=None):
+        if text is None:
+            text, ok = QInputDialog.getMultiLineText(
+                self, "Paste a quirk file - %s" % TITLE, "The quirk file, or a post with one in a ```yaml block:",
+                QApplication.clipboard().text())
+            if not ok:
+                return None
+        return self.take_in(text, "pasted text, %s" % devicedata.today())
+
     def file_chosen(self, *_):
         e = self.entry()
         self.rows, self.at = [], 0
+        online = e is not None and bool(e.get("url"))
+        self.thread_button.setVisible(online)
+        self.report_button.setVisible(online)
         self.whole_button.setVisible(e is not None and not e["problems"])
         if self.whole_button.isChecked():
             self.show_facts()
@@ -464,7 +555,8 @@ class DeviceDataDialog(QDialog):
                 self.rows = [r for r in devicedata.compare(self.ident, e["raw"]) if not r["same"]]
                 same = len(devicedata.facts(e["raw"])) - len(self.rows)
                 words = [r.get("words") for r in e.get("reports") or [] if r.get("words")]
-                self.file_info.setText("%d fact%s differ from what is in use%s.%s" % (
+                self.file_info.setText("%s%d fact%s differ from what is in use%s.%s" % (
+                    "The sender wrote: \"%s\"\n" % e["words"][:300] if e.get("words") else "",
                     len(self.rows), "" if len(self.rows) == 1 else "s",
                     ", %d are the same" % same if same else "",
                     (" Latest report: \"%s\"" % words[-1][:200]) if words else ""))
