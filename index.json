@@ -2,6 +2,7 @@
  "files": [
   {
    "author": "MetalMusings",
+   "created": "2026-11-26T17:30:12Z",
    "discussion": 1,
    "facts": 2,
    "name": "TEST device (prototype check, not a real device)",
@@ -23,10 +24,12 @@
    ],
    "upvotes": 1,
    "url": "https://github.com/MetalMusings/ecat-devices-test/discussions/1",
-   "vendor": "0x00000099"
+   "vendor": "0x00000099",
+   "words": ""
   },
   {
    "author": "MetalMusings",
+   "created": "2026-11-26T18:33:55Z",
    "discussion": 3,
    "facts": 1,
    "name": "ECT60V202(COE)",
@@ -35,7 +38,8 @@
    "reports": [],
    "upvotes": 1,
    "url": "https://github.com/MetalMusings/ecat-devices-test/discussions/3",
-   "vendor": "0x00000A88"
+   "vendor": "0x00000A88",
+   "words": ""
   }
  ],
  "format": 1
